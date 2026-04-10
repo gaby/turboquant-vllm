@@ -59,7 +59,7 @@ def _register_native_backend() -> bool:
 
         register_backend(
             AttentionBackendEnum.CUSTOM,
-            "turboquant_vllm.native_backend.TurboQuantAttentionBackend",
+            f"{TurboQuantAttentionBackend.__module__}.{TurboQuantAttentionBackend.__name__}",
         )
         logger.info("TurboQuant native backend registered as CUSTOM (pid=%d)", os.getpid())
     except Exception as e:
@@ -70,16 +70,21 @@ def _register_native_backend() -> bool:
     try:
         from vllm.platforms.cuda import CudaPlatform
 
-        _orig_get_valid = CudaPlatform.get_valid_backends.__func__
+        _orig_get_valid_descriptor = CudaPlatform.__dict__.get("get_valid_backends")
+        _orig_get_valid = getattr(_orig_get_valid_descriptor, "__func__", None)
+        if _orig_get_valid is None:
+            _orig_get_valid = getattr(CudaPlatform.get_valid_backends, "__func__", None)
+        if _orig_get_valid is None:
+            _orig_get_valid = CudaPlatform.get_valid_backends
 
-        def _tq_get_valid_backends(self, device_capability, attn_selector_config, num_heads=None):
+        def _tq_get_valid_backends(cls, device_capability, attn_selector_config, num_heads=None):
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
             if kv_cache_dtype is not None and str(kv_cache_dtype).startswith("tq"):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
-            return _orig_get_valid(self, device_capability, attn_selector_config, num_heads)
+            return _orig_get_valid(cls, device_capability, attn_selector_config, num_heads)
 
-        CudaPlatform.get_valid_backends = _tq_get_valid_backends
+        CudaPlatform.get_valid_backends = classmethod(_tq_get_valid_backends)
         logger.debug("TurboQuant patched CudaPlatform.get_valid_backends")
     except Exception as e:
         logger.warning("Could not patch CudaPlatform.get_valid_backends: %s", e)
