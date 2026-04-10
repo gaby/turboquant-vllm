@@ -70,6 +70,8 @@ def _register_native_backend() -> bool:
     try:
         from vllm.platforms.cuda import CudaPlatform
 
+        # Preserve the original unbound function regardless of whether vLLM
+        # exposes the method as a raw function, bound method, or classmethod.
         _orig_get_valid_descriptor = CudaPlatform.__dict__.get("get_valid_backends")
         _orig_get_valid = getattr(_orig_get_valid_descriptor, "__func__", None)
         if _orig_get_valid is None:

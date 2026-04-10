@@ -68,6 +68,8 @@ def test_register_native_backend_preserves_classmethod_semantics(monkeypatch):
             "turboquant_vllm.native_backend.TurboQuantAttentionBackend",
         )
     ]
+    # Regresses the original bug: replacing a classmethod with a plain function
+    # causes the fallback path to bind arguments incorrectly.
     assert isinstance(FakeCudaPlatform.__dict__["get_valid_backends"], classmethod)
 
     tq_backends, tq_meta = FakeCudaPlatform.get_valid_backends(
