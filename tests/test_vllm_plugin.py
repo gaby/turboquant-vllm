@@ -1,5 +1,4 @@
 import importlib
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -33,6 +32,10 @@ def test_register_native_backend_preserves_classmethod_semantics(monkeypatch):
     platforms_cuda_module.CudaPlatform = FakeCudaPlatform
 
     native_backend_module = types.ModuleType("turboquant_vllm.native_backend")
+    turboquant_package = types.ModuleType("turboquant_vllm")
+    turboquant_package.__path__ = [
+        str(Path(__file__).resolve().parents[1] / "turboquant_vllm")
+    ]
 
     class TurboQuantAttentionBackend:
         pass
@@ -48,18 +51,15 @@ def test_register_native_backend_preserves_classmethod_semantics(monkeypatch):
         "vllm.v1.attention.backends.registry": registry_module,
         "vllm.platforms": types.ModuleType("vllm.platforms"),
         "vllm.platforms.cuda": platforms_cuda_module,
+        "turboquant_vllm": turboquant_package,
         "turboquant_vllm.native_backend": native_backend_module,
     }
 
     for name, module in stub_modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    plugin_path = Path(__file__).resolve().parents[1] / "turboquant_vllm" / "_vllm_plugin.py"
-    spec = importlib.util.spec_from_file_location("test_vllm_plugin_module", plugin_path)
-    assert spec is not None and spec.loader is not None
-    plugin = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = plugin
-    spec.loader.exec_module(plugin)
+    monkeypatch.delitem(sys.modules, "turboquant_vllm._vllm_plugin", raising=False)
+    plugin = importlib.import_module("turboquant_vllm._vllm_plugin")
 
     assert plugin._register_native_backend() is True
     assert registry_calls == [
