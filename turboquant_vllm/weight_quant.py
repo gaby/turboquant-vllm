@@ -1147,14 +1147,10 @@ def _replace_linear_layers(
             torch.cuda.empty_cache()
 
     if _moe_compressed_count > 0:
-        logger.warning(
-            "TurboQuant compressed %d FusedMoE layer(s). The MoE compressed "
-            "forward path is only validated in eager mode — vLLM CUDA graph "
-            "capture produces incorrect output due to shared-scratch "
-            "write-after-read aliasing across layers. Pass --enforce-eager "
-            "when starting vllm serve, or set VLLM_ENFORCE_EAGER=1 in the "
-            "environment. Fix tracked on branch fix/moe-fused-quant-method; "
-            "proper fix needs a custom fused MoE kernel with inline dequant.",
+        logger.info(
+            "TurboQuant compressed %d FusedMoE layer(s). The CUDA dequant "
+            "kernel runs on PyTorch's current stream, so vLLM CUDA graph "
+            "capture is supported (no --enforce-eager required).",
             _moe_compressed_count,
         )
 

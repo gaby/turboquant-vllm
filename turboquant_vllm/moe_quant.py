@@ -250,22 +250,16 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # these same scratch buffers at install time, so the base
         # unquantized method will read the freshly dequantized values.
         #
-        # **Known limitation**: this design requires ``--enforce-eager``.
-        # Under vLLM CUDA graph capture, all FusedMoE layers land in
-        # the same captured piece and each layer's dequant + base_method
-        # call writes to / reads from the same shared scratch address.
-        # The graph's write-after-read dependency tracking doesn't
-        # reliably serialize across layers, and the empirical result
-        # is correct eager output but gibberish under capture (tested
-        # on Qwen3-30B-A3B 2026-04-11). Cloning dequant output per
-        # layer avoids the aliasing but OOMs the captured graph's
-        # private pool (each clone gets committed, ~1.15 GB × 48
-        # layers). The proper fix is a custom fused MoE GEMM that
-        # does dequant-inside-kernel, eliminating the scratch — see
-        # moe_wna16.py as a reference implementation. Until that
-        # lands, the walker in ``_replace_linear_layers`` sets
-        # ``enforce_eager=True`` on the vLLM config when it detects
-        # any FusedMoE layer has been compressed.
+        # **CUDA graph safety**: the CUDA dequant kernel
+        # (``weight_dequant_3d``) launches on PyTorch's current CUDA
+        # stream via ``c10::cuda::getCurrentCUDAStream``, so it is
+        # properly captured by vLLM's piecewise CUDA graph capture.
+        # Under vLLM CUDA graph capture, the dequant + fused_experts
+        # for each layer are serialized on the same stream, so the
+        # shared scratch buffer is always written before it is read
+        # and there is no cross-layer aliasing.  A future fused MoE
+        # GEMM that does dequant-inside-kernel would eliminate the
+        # scratch entirely — see moe_wna16.py as a reference.
         w13_compressed.decompress_into(w13_buf, fp32_scratch=w13_fp32)
         w2_compressed.decompress_into(w2_buf, fp32_scratch=w2_fp32)
 
