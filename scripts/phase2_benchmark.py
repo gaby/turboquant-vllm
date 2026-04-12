@@ -48,7 +48,7 @@ def get_gpu_memory():
 def start_server(tq_enabled=False, k_bits=4, v_bits=3, cudagraph_mode="FULL_AND_PIECEWISE"):
     """Start vLLM server, return process."""
     env = os.environ.copy()
-    compilation_config = compilation_config_json(cudagraph_mode)
+    comp_cfg = compilation_config_json(cudagraph_mode)
 
     if tq_enabled:
         # Start with TQ+ patch, then use vLLM v0.19.0 API:
@@ -72,10 +72,11 @@ from vllm.entrypoints.openai.api_server import FlexibleArgumentParser, make_arg_
 
 parser = FlexibleArgumentParser(description="vLLM TQ+ server")
 parser = make_arg_parser(parser)
+comp_cfg = {comp_cfg!r}
 args = parser.parse_args(['--model', '{MODEL}',
     '--max-model-len', '{MAX_MODEL_LEN}',
     '--gpu-memory-utilization', '0.9',
-    '--compilation-config', '{compilation_config}',
+    '--compilation-config', comp_cfg,
     '--port', '{PORT}',
     '--host', '0.0.0.0'])
 validate_parsed_serve_args(args)
@@ -95,7 +96,7 @@ asyncio.run(run_server(args))
             "--gpu-memory-utilization",
             "0.9",
             "--compilation-config",
-            compilation_config,
+            comp_cfg,
             "--port",
             str(PORT),
             "--host",
