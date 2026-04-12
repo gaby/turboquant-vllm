@@ -92,9 +92,7 @@ def register():
             sensitive_bits = cls.get_from_keys_or(config, ["sensitive_bits"], None)
             return cls(bits=bits, group_size=group_size, sensitive_bits=sensitive_bits)
 
-        def get_quant_method(
-            self, layer: nn.Module, prefix: str
-        ) -> "QuantizeMethodBase | None":
+        def get_quant_method(self, layer: nn.Module, prefix: str) -> "QuantizeMethodBase | None":
             # Native TQ3 checkpoints are decompressed to bf16 during
             # weight loading (see _patch_weight_name_remapping).  All
             # layers receive standard bf16 weights via unquantized
@@ -102,12 +100,14 @@ def register():
             # re-compresses on GPU after loading.
             if isinstance(layer, LinearBase):
                 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
                 return UnquantizedLinearMethod()
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
                 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
                     UnquantizedFusedMoEMethod,
                 )
+
                 if isinstance(layer, FusedMoE):
                     return UnquantizedFusedMoEMethod(layer.moe_config)
             except ImportError:
@@ -158,7 +158,7 @@ def _patch_weight_name_remapping():
         # Tensors arrive in checkpoint order — packed and norms for the
         # same weight are adjacent (both in the same shard, consecutive).
         pending_packed = {}  # base_name → packed tensor
-        pending_norms = {}   # base_name → norms tensor
+        pending_norms = {}  # base_name → norms tensor
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".weight.tq_packed"):
@@ -187,8 +187,12 @@ def _patch_weight_name_remapping():
                 n_groups = norms.shape[1]
                 in_dim = n_groups * group_size
                 comp = Compressed3D.from_packed(
-                    packed, norms, (1, n_rows, in_dim),
-                    torch.bfloat16, bits, group_size,
+                    packed,
+                    norms,
+                    (1, n_rows, in_dim),
+                    torch.bfloat16,
+                    bits,
+                    group_size,
                 )
                 w = comp.decompress().squeeze(0)  # (1, n_rows, in_dim) → (n_rows, in_dim)
 
