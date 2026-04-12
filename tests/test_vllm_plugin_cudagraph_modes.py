@@ -60,6 +60,7 @@ def test_register_kv_path_warns_when_cudagraph_is_enabled(monkeypatch):
     )
     warning_messages = " ".join(str(call.args[0]) for call in warn.call_args_list if call.args)
     assert "CUDAGRAPH_MODE=%s" in warning_messages
+    assert any(call.args and "FULL_AND_PIECEWISE" in call.args[1:] for call in warn.call_args_list)
 
 
 def test_register_kv_path_no_graph_warning_for_none_mode(monkeypatch):

@@ -113,7 +113,7 @@ def register():
     # Legacy monkey-patch KV compression — retained for MLA models where
     # upstream TurboQuant (vllm-project/vllm#38479) does not yet apply.
     if kv_k_bits is not None:
-        if cudagraph_mode != "NONE":
+        if cudagraph_mode and cudagraph_mode != "NONE":
             logger.warning(
                 "Legacy TurboQuant KV monkey-patch with CUDAGRAPH_MODE=%s may fail on non-MLA models. "
                 "Use CUDAGRAPH_MODE=NONE for this path, or prefer the upstream native KV cache integration.",
