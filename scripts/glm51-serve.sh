@@ -19,6 +19,8 @@ TP="${TP:-4}"
 GPU_MEM="${GPU_MEM:-0.85}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 PORT="${PORT:-8000}"
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
+COMPILATION_CONFIG="{\"cudagraph_mode\":\"${CUDAGRAPH_MODE}\"}"
 LOG="/tmp/glm51-serve.log"
 SERVER_LOG="/tmp/glm51-serve-server.log"
 RESULT="/tmp/glm51-serve-result.txt"
@@ -29,6 +31,7 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== GLM-5.1 TQ3 Serving Test ==="
 echo "Model: $MODEL"
 echo "TP: $TP"
+echo "CUDAGRAPH_MODE: $CUDAGRAPH_MODE"
 echo "Date: $(date -u)"
 echo "GPUs:"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
@@ -58,6 +61,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization "$GPU_MEM" \
     --max-model-len "$MAX_MODEL_LEN" \
     --dtype bfloat16 \
+    --compilation-config "$COMPILATION_CONFIG" \
     --port $PORT \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!

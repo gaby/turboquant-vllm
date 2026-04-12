@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+from turboquant_vllm.cudagraph_modes import compilation_config_json
+
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 MODEL = "Qwen/Qwen3-30B-A3B"
@@ -76,7 +78,7 @@ def get_gpu_memory():
     return int(result.stdout.strip())
 
 
-def start_server(cfg):
+def start_server(cfg, cudagraph_mode="FULL_AND_PIECEWISE"):
     """Start vLLM server with TQ+ weight compression."""
     config_name = cfg["name"]
     prune = cfg["prune"]
@@ -84,6 +86,7 @@ def start_server(cfg):
     kurtosis = cfg["kurtosis"]
     bits = cfg["bits"]
 
+    compilation_config = compilation_config_json(cudagraph_mode)
     routed_arg = f", routed_expert_bits={routed_bits}" if routed_bits else ""
     cmd = [
         sys.executable,
@@ -104,7 +107,7 @@ parser = make_arg_parser(parser)
 args = parser.parse_args(['--model', '{MODEL}',
     '--max-model-len', '{MAX_MODEL_LEN}',
     '--gpu-memory-utilization', '0.95',
-    '--enforce-eager',
+    '--compilation-config', '{compilation_config}',
     '--port', '{PORT}',
     '--host', '0.0.0.0'])
 validate_parsed_serve_args(args)
@@ -181,7 +184,7 @@ def kill_server(proc):
     time.sleep(5)
 
 
-def run_benchmark(cfg):
+def run_benchmark(cfg, cudagraph_mode="FULL_AND_PIECEWISE"):
     name = cfg["name"]
     print(f"\n{'=' * 60}")
     print(f"CONFIG: {name}")
@@ -190,7 +193,7 @@ def run_benchmark(cfg):
     mem_before = get_gpu_memory()
     print(f"GPU memory before: {mem_before} MiB")
 
-    proc = start_server(cfg)
+    proc = start_server(cfg, cudagraph_mode=cudagraph_mode)
     print("Waiting for server (model loading + compression)...")
 
     if not wait_for_server(timeout=600):
@@ -235,13 +238,15 @@ def run_benchmark(cfg):
 
 
 if __name__ == "__main__":
+    cudagraph_mode = os.environ.get("CUDAGRAPH_MODE", "FULL_AND_PIECEWISE")
     print("=" * 60)
     print("Phase 4 Benchmark: Expert Pruning + TQ2 on Qwen3-30B")
+    print(f"CUDAGRAPH_MODE={cudagraph_mode}")
     print("=" * 60)
 
     all_results = {}
     for cfg in CONFIGS:
-        result = run_benchmark(cfg)
+        result = run_benchmark(cfg, cudagraph_mode=cudagraph_mode)
         if result:
             all_results[cfg["name"]] = result
 

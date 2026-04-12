@@ -249,6 +249,16 @@ ENV TQ_WEIGHT_BITS=3
 TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
 ```
 
+CUDA graph modes supported by vLLM v1 are also supported with TurboQuant weight compression:
+`NONE`, `PIECEWISE`, `FULL`, `FULL_DECODE_ONLY`, `FULL_AND_PIECEWISE`.
+
+```bash
+# Example: explicit mode selection
+TQ_WEIGHT_BITS=3 \
+vllm serve google/gemma-4-26B-A4B-it \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
 Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. Weight compression inspired by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
 ### Results

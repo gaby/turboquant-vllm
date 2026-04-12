@@ -18,6 +18,8 @@ import sys
 import time
 import torch
 
+from turboquant_vllm.cudagraph_modes import compilation_config_json
+
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 MODEL = "google/gemma-4-26B-A4B-it"
@@ -36,8 +38,12 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
+    cudagraph_mode = os.environ.get("CUDAGRAPH_MODE", "FULL_AND_PIECEWISE")
+    compilation_config = compilation_config_json(cudagraph_mode)
+
     print("=" * 60, flush=True)
     print("AWQ Export + Marlin Serving Test", flush=True)
+    print(f"CUDAGRAPH_MODE={cudagraph_mode}", flush=True)
     print("=" * 60, flush=True)
 
     # Step 1: Export
@@ -82,7 +88,8 @@ def main():
         "4096",
         "--gpu-memory-utilization",
         "0.9",
-        "--enforce-eager",
+        "--compilation-config",
+        compilation_config,
         "--port",
         str(PORT),
         "--host",

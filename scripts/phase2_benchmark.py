@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+from turboquant_vllm.cudagraph_modes import compilation_config_json
+
 # Force unbuffered output
 os.environ["PYTHONUNBUFFERED"] = "1"
 
@@ -43,9 +45,10 @@ def get_gpu_memory():
     return int(result.stdout.strip())
 
 
-def start_server(tq_enabled=False, k_bits=4, v_bits=3):
+def start_server(tq_enabled=False, k_bits=4, v_bits=3, cudagraph_mode="FULL_AND_PIECEWISE"):
     """Start vLLM server, return process."""
     env = os.environ.copy()
+    compilation_config = compilation_config_json(cudagraph_mode)
 
     if tq_enabled:
         # Start with TQ+ patch, then use vLLM v0.19.0 API:
@@ -72,7 +75,7 @@ parser = make_arg_parser(parser)
 args = parser.parse_args(['--model', '{MODEL}',
     '--max-model-len', '{MAX_MODEL_LEN}',
     '--gpu-memory-utilization', '0.9',
-    '--enforce-eager',
+    '--compilation-config', '{compilation_config}',
     '--port', '{PORT}',
     '--host', '0.0.0.0'])
 validate_parsed_serve_args(args)
@@ -91,7 +94,8 @@ asyncio.run(run_server(args))
             str(MAX_MODEL_LEN),
             "--gpu-memory-utilization",
             "0.9",
-            "--enforce-eager",
+            "--compilation-config",
+            compilation_config,
             "--port",
             str(PORT),
             "--host",
@@ -171,7 +175,7 @@ def kill_server(proc):
     time.sleep(5)
 
 
-def run_benchmark(name, tq_enabled=False, k_bits=4, v_bits=3):
+def run_benchmark(name, tq_enabled=False, k_bits=4, v_bits=3, cudagraph_mode="FULL_AND_PIECEWISE"):
     """Run full benchmark for one configuration."""
     print(f"\n{'=' * 60}")
     print(f"CONFIG: {name}")
@@ -180,7 +184,7 @@ def run_benchmark(name, tq_enabled=False, k_bits=4, v_bits=3):
     mem_before = get_gpu_memory()
     print(f"GPU memory before: {mem_before} MiB")
 
-    proc = start_server(tq_enabled=tq_enabled, k_bits=k_bits, v_bits=v_bits)
+    proc = start_server(tq_enabled=tq_enabled, k_bits=k_bits, v_bits=v_bits, cudagraph_mode=cudagraph_mode)
 
     print("Waiting for server...")
     if not wait_for_server():
@@ -216,9 +220,11 @@ def run_benchmark(name, tq_enabled=False, k_bits=4, v_bits=3):
 
 if __name__ == "__main__":
     tq_only = "--tq-only" in sys.argv
+    cudagraph_mode = os.environ.get("CUDAGRAPH_MODE", "FULL_AND_PIECEWISE")
 
     print("=" * 60)
     print("TQ+ Phase 2 Benchmark: Gemma 4 26B MoE on A100 80GB")
+    print(f"CUDAGRAPH_MODE={cudagraph_mode}")
     print("=" * 60)
 
     if tq_only:
@@ -260,10 +266,16 @@ if __name__ == "__main__":
         }
         print("Using cached baseline (73699 MiB)")
     else:
-        baseline = run_benchmark("Baseline (FP16 KV)", tq_enabled=False)
+        baseline = run_benchmark("Baseline (FP16 KV)", tq_enabled=False, cudagraph_mode=cudagraph_mode)
 
     # Test 2: TQ+ Phase 2
-    tqplus = run_benchmark("TQ+ Phase 2 (K4/V3, NC, sinks, boundary)", tq_enabled=True, k_bits=4, v_bits=3)
+    tqplus = run_benchmark(
+        "TQ+ Phase 2 (K4/V3, NC, sinks, boundary)",
+        tq_enabled=True,
+        k_bits=4,
+        v_bits=3,
+        cudagraph_mode=cudagraph_mode,
+    )
 
     # Summary
     print(f"\n{'=' * 60}")

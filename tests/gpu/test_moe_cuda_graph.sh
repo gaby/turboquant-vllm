@@ -26,6 +26,8 @@ BITS="${BITS:-3}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 PORT="${PORT:-8000}"
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
+COMPILATION_CONFIG="{\"cudagraph_mode\":\"${CUDAGRAPH_MODE}\"}"
 LOG="/tmp/tq-moe-graph.log"
 SERVER_LOG="/tmp/tq-moe-graph-server.log"
 RESULT="/tmp/tq-moe-graph-result.txt"
@@ -36,6 +38,7 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "=== MoE CUDA graph test ==="
 echo "Model: $MODEL"
+echo "CUDAGRAPH_MODE: $CUDAGRAPH_MODE"
 echo "Date: $(date -u)"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'unknown')"
 echo ""
@@ -63,6 +66,7 @@ nohup python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization "$GPU_MEM" \
     --max-model-len "$MAX_MODEL_LEN" \
     --dtype bfloat16 \
+    --compilation-config "$COMPILATION_CONFIG" \
     --port "$PORT" \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
