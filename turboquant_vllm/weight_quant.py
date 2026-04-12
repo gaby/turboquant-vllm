@@ -539,9 +539,7 @@ class Compressed3D:
         obj.compressed_bytes = packed.numel() + norms.numel() * 4
         return obj
 
-    def decompress_into(
-        self, out: torch.Tensor, fp32_scratch: torch.Tensor | None = None
-    ) -> None:
+    def decompress_into(self, out: torch.Tensor, fp32_scratch: torch.Tensor | None = None) -> None:
         """Write decompressed weights into a pre-allocated ``out`` buffer.
 
         ``out`` must have ``shape == self.shape`` and ``dtype == self.dtype``,
@@ -556,12 +554,8 @@ class Compressed3D:
         allocation is baked into the replayed graph). If None, a fresh
         fp32 buffer is allocated per call.
         """
-        assert out.shape == self.shape, (
-            f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
-        )
-        assert out.dtype == self.dtype, (
-            f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
-        )
+        assert out.shape == self.shape, f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
+        assert out.dtype == self.dtype, f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
         assert out.device == self.packed.device, (
             f"decompress_into expected device {self.packed.device}, got {out.device}"
         )
@@ -581,9 +575,7 @@ class Compressed3D:
             assert fp32_scratch.device == self.packed.device
             target = fp32_scratch
         else:
-            target = torch.empty(
-                self.shape, dtype=kernel_dtype, device=self.packed.device
-            )
+            target = torch.empty(self.shape, dtype=kernel_dtype, device=self.packed.device)
 
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
         cuda_mod.weight_dequant_3d(
@@ -670,9 +662,7 @@ class Compressed3D:
         return self.original_bytes / self.compressed_bytes if self.compressed_bytes > 0 else 0
 
 
-def _compress_3d_param(
-    module: nn.Module, param_name: str, bits: int, group_size: int
-) -> tuple[int, int]:
+def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size: int) -> tuple[int, int]:
     """Compress a 3D parameter in-place with real memory savings.
 
     Stores the :class:`Compressed3D` as ``module._tq_{param_name}`` and
@@ -1024,8 +1014,7 @@ def _replace_linear_layers(
                 continue
             if w13_param.dim() != 3 or w2_param.dim() != 3:
                 logger.warning(
-                    "FusedMoE at %s has unexpected weight rank "
-                    "(w13=%d, w2=%d) — skipping",
+                    "FusedMoE at %s has unexpected weight rank (w13=%d, w2=%d) — skipping",
                     name,
                     w13_param.dim(),
                     w2_param.dim(),
@@ -1061,18 +1050,10 @@ def _replace_linear_layers(
             if moe_scratch_pool is not None:
                 w13_c = module._tq_w13_weight
                 w2_c = module._tq_w2_weight
-                w13_buf = moe_scratch_pool.ensure(
-                    "w13", w13_c.shape, w13_c.dtype, w13_c.packed.device
-                )
-                w2_buf = moe_scratch_pool.ensure(
-                    "w2", w2_c.shape, w2_c.dtype, w2_c.packed.device
-                )
-                moe_scratch_pool.ensure(
-                    "w13_fp32", w13_c.shape, torch.float32, w13_c.packed.device
-                )
-                moe_scratch_pool.ensure(
-                    "w2_fp32", w2_c.shape, torch.float32, w2_c.packed.device
-                )
+                w13_buf = moe_scratch_pool.ensure("w13", w13_c.shape, w13_c.dtype, w13_c.packed.device)
+                w2_buf = moe_scratch_pool.ensure("w2", w2_c.shape, w2_c.dtype, w2_c.packed.device)
+                moe_scratch_pool.ensure("w13_fp32", w13_c.shape, torch.float32, w13_c.packed.device)
+                moe_scratch_pool.ensure("w2_fp32", w2_c.shape, torch.float32, w2_c.packed.device)
 
                 # Permanently re-point every FusedMoE layer's w13_weight.data
                 # / w2_weight.data at the shared scratch buffers. ALL layers

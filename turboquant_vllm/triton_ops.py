@@ -370,7 +370,6 @@ def rotate_input(
 
 
 if HAS_TRITON:
-
     # Autotune key deliberately excludes `batch_size`. Under vLLM 0.19
     # piecewise CUDA graph capture, each of the ~51 capture batch sizes
     # would otherwise trigger its own 10-config autotune run per Linear
@@ -641,9 +640,7 @@ try:
     _tq_fused_gemm_impl = tq_fused_gemm
     _tq_fwht_input_gemm_impl = tq_fwht_input_gemm
 
-    @torch.library.custom_op(
-        "turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",)
-    )
+    @torch.library.custom_op("turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",))
     def _tq_fused_gemm_op(
         x: torch.Tensor,
         packed_weight: torch.Tensor,
@@ -656,8 +653,15 @@ try:
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return _tq_fused_gemm_impl(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size=group_size, bits=bits, bias=bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=bias,
         )
 
     @_tq_fused_gemm_op.register_fake
@@ -665,9 +669,7 @@ try:
         N = norms.shape[0]
         return x.new_empty((*x.shape[:-1], N))
 
-    @torch.library.custom_op(
-        "turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",)
-    )
+    @torch.library.custom_op("turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",))
     def _tq_fwht_input_gemm_op(
         x: torch.Tensor,
         packed_weight: torch.Tensor,
@@ -680,8 +682,15 @@ try:
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return _tq_fwht_input_gemm_impl(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size=group_size, bits=bits, bias=bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=bias,
         )
 
     @_tq_fwht_input_gemm_op.register_fake
@@ -693,21 +702,49 @@ try:
     # not supported across the custom_op boundary (schema is positional),
     # so we wrap to restore the original keyword-friendly call signature.
     def tq_fused_gemm(  # type: ignore[no-redef]
-        x, packed_weight, norms, signs1, signs2, centroids,
-        group_size=128, bits=4, bias=None,
+        x,
+        packed_weight,
+        norms,
+        signs1,
+        signs2,
+        centroids,
+        group_size=128,
+        bits=4,
+        bias=None,
     ):
         return torch.ops.turboquant.tq_fused_gemm(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size, bits, bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size,
+            bits,
+            bias,
         )
 
     def tq_fwht_input_gemm(  # type: ignore[no-redef]
-        x, packed_weight, norms, signs1, signs2, centroids,
-        group_size=128, bits=4, bias=None,
+        x,
+        packed_weight,
+        norms,
+        signs1,
+        signs2,
+        centroids,
+        group_size=128,
+        bits=4,
+        bias=None,
     ):
         return torch.ops.turboquant.tq_fwht_input_gemm(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size, bits, bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size,
+            bits,
+            bias,
         )
 
 except (AttributeError, RuntimeError):
@@ -715,5 +752,3 @@ except (AttributeError, RuntimeError):
     # the plain Python functions. Eager mode still works; fullgraph compile
     # will re-surface the underlying tracing error.
     pass
-
-

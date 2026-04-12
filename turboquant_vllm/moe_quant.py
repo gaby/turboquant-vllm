@@ -38,11 +38,16 @@ See varjoranta/turboquant-vllm#14 for the bug report this fixes.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
-from vllm.logger import init_logger
+try:
+    from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 
 try:
@@ -133,6 +138,7 @@ class TurboQuantFusedMoEScratchPool:
 if _HAS_FUSED_MOE:
     _register_custom_op = CustomOp.register("turboquant_fused_moe")
 else:
+
     def _register_custom_op(cls):
         return cls
 
@@ -160,8 +166,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def __init__(self, moe_config, scratch_pool: TurboQuantFusedMoEScratchPool):
         if not _HAS_FUSED_MOE:
             raise RuntimeError(
-                "TurboQuantFusedMoEMethod requires vllm.model_executor.layers."
-                "fused_moe — import failed at module load."
+                "TurboQuantFusedMoEMethod requires vllm.model_executor.layers.fused_moe — import failed at module load."
             )
         # Both bases must be initialized: FusedMoEMethodBase needs
         # moe_config; CustomOp needs to set up its nn.Module state.
