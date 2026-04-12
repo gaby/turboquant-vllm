@@ -179,6 +179,7 @@ void tq_weight_dequant(
     // Only re-upload constant memory when config changes.
     // Use cudaMemcpyToSymbolAsync so the copy is graph-capturable and
     // ordered on the same stream as the kernel launch.
+    // Args: (symbol, src, count, offset_into_symbol, kind, stream).
     const float* cptr = centroids.data_ptr<float>();
     const float* s1ptr = signs1.data_ptr<float>();
     const float* s2ptr = signs2.data_ptr<float>();
