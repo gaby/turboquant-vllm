@@ -58,9 +58,13 @@ def test_register_kv_path_warns_when_cudagraph_is_enabled(monkeypatch):
         rotation="wht",
         boundary_layers=5,
     )
-    warning_messages = " ".join(str(call.args[0]) for call in warn.call_args_list if call.args)
-    assert "CUDAGRAPH_MODE=%s" in warning_messages
-    assert any(call.args and "FULL_AND_PIECEWISE" in call.args[1:] for call in warn.call_args_list)
+    legacy_warning_calls = [
+        call
+        for call in warn.call_args_list
+        if call.args and "Legacy TurboQuant KV monkey-patch with CUDAGRAPH_MODE=%s" in str(call.args[0])
+    ]
+    assert legacy_warning_calls
+    assert legacy_warning_calls[0].args[1] == "FULL_AND_PIECEWISE"
 
 
 def test_register_kv_path_no_graph_warning_for_none_mode(monkeypatch):
