@@ -28,8 +28,6 @@ Vibhav's branch directly:
 import logging
 import os
 
-from turboquant_vllm.cudagraph_modes import normalize_cudagraph_mode
-
 try:
     from vllm.logger import init_logger
 
@@ -46,17 +44,6 @@ except ImportError:
 
 
 _patched = False
-
-
-def _resolve_cudagraph_mode(weight_bits: str | None, kv_k_bits: str | None) -> str | None:
-    """Resolve and validate CUDAGRAPH_MODE when TurboQuant runtime paths are active."""
-    if weight_bits is None and kv_k_bits is None:
-        return None
-    raw_mode = os.environ.get("CUDAGRAPH_MODE")
-    try:
-        return normalize_cudagraph_mode(raw_mode)
-    except ValueError as e:
-        raise ValueError(f"Invalid CUDAGRAPH_MODE={raw_mode!r}. {e}") from e
 
 
 def register():
@@ -79,14 +66,11 @@ def register():
     if weight_bits is None and kv_k_bits is None:
         return
 
-    cudagraph_mode = _resolve_cudagraph_mode(weight_bits, kv_k_bits)
-
     logger.info(
-        "TurboQuant plugin activated (pid=%d, TQ_WEIGHT_BITS=%s, TQ_KV_K_BITS=%s, CUDAGRAPH_MODE=%s)",
+        "TurboQuant plugin activated (pid=%d, TQ_WEIGHT_BITS=%s, TQ_KV_K_BITS=%s)",
         os.getpid(),
         weight_bits,
         kv_k_bits,
-        cudagraph_mode,
     )
 
     if _patched:
@@ -113,12 +97,6 @@ def register():
     # Legacy monkey-patch KV compression — retained for MLA models where
     # upstream TurboQuant (vllm-project/vllm#38479) does not yet apply.
     if kv_k_bits is not None:
-        if cudagraph_mode and cudagraph_mode != "NONE":
-            logger.warning(
-                "Legacy TurboQuant KV monkey-patch with CUDAGRAPH_MODE=%s may fail on non-MLA models. "
-                "Use CUDAGRAPH_MODE=NONE for this path, or prefer the upstream native KV cache integration.",
-                cudagraph_mode,
-            )
         k_bits = int(kv_k_bits)
         v_bits = int(os.environ.get("TQ_KV_V_BITS", str(k_bits)))
         norm_correction = os.environ.get("TQ_KV_NORM_CORRECTION", "1") == "1"
