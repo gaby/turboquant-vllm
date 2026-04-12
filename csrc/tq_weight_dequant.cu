@@ -161,6 +161,26 @@ void tq_weight_dequant(
                 "group_size must be 64, 128, or 256");
     TORCH_CHECK(bits >= 2 && bits <= 4, "bits must be 2-4");
 
+    // cudaMemcpyToSymbolAsync with cudaMemcpyDeviceToDevice requires source
+    // pointers to be device memory on the same CUDA device, float32, and
+    // contiguous.
+    auto dev = packed_weight.device();
+    TORCH_CHECK(centroids.is_cuda() && centroids.device() == dev,
+                "centroids must be a CUDA tensor on the same device as packed_weight");
+    TORCH_CHECK(centroids.is_contiguous(), "centroids must be contiguous");
+    TORCH_CHECK(centroids.scalar_type() == at::ScalarType::Float,
+                "centroids must be float32");
+    TORCH_CHECK(signs1.is_cuda() && signs1.device() == dev,
+                "signs1 must be a CUDA tensor on the same device as packed_weight");
+    TORCH_CHECK(signs1.is_contiguous(), "signs1 must be contiguous");
+    TORCH_CHECK(signs1.scalar_type() == at::ScalarType::Float,
+                "signs1 must be float32");
+    TORCH_CHECK(signs2.is_cuda() && signs2.device() == dev,
+                "signs2 must be a CUDA tensor on the same device as packed_weight");
+    TORCH_CHECK(signs2.is_contiguous(), "signs2 must be contiguous");
+    TORCH_CHECK(signs2.scalar_type() == at::ScalarType::Float,
+                "signs2 must be float32");
+
     int n_groups = (in_dim + group_size - 1) / group_size;
     int packed_group_bytes;
     if (bits == 4) packed_group_bytes = group_size / 2;
