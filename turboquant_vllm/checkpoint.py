@@ -101,7 +101,7 @@ def save_tq3_checkpoint(
         logger.info("Using local checkpoint at %s", model_id)
     else:
         logger.info("Downloading config and tokenizer for %s...", model_id)
-    logger.info("Saving config and tokenizer into %s...", output_dir)
+    logger.info("Will save config and tokenizer into %s...", output_dir)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Do NOT inject quantization_config into config.json — vLLM
@@ -125,7 +125,10 @@ def save_tq3_checkpoint(
             shutil.copy2(src, dst)
             copied_json += 1
             logger.info("Copied local config JSON: %s", filename)
-        logger.info("Copied %d additional local JSON config file(s)", copied_json)
+        if copied_json > 0:
+            logger.info("Copied %d additional local JSON config file(s)", copied_json)
+        else:
+            logger.info("No additional local JSON config files to copy")
 
     if is_local:
         shard_files = sorted(f for f in os.listdir(model_id) if f.endswith(".safetensors"))
