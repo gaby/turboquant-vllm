@@ -101,7 +101,6 @@ def save_tq3_checkpoint(
         logger.info("Using local checkpoint at %s", model_id)
     else:
         logger.info("Downloading config and tokenizer for %s...", model_id)
-    logger.info("Will save config and tokenizer into %s...", output_dir)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Do NOT inject quantization_config into config.json — vLLM
@@ -113,6 +112,7 @@ def save_tq3_checkpoint(
         config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    logger.info("Saved config and tokenizer to %s", output_dir)
     if is_local:
         copied_json = 0
         for filename in sorted(os.listdir(model_id)):
@@ -120,7 +120,10 @@ def save_tq3_checkpoint(
                 continue
             src = os.path.join(model_id, filename)
             dst = os.path.join(output_dir, filename)
-            if not os.path.isfile(src) or os.path.exists(dst):
+            if not os.path.isfile(src):
+                continue
+            if os.path.exists(dst):
+                logger.info("Skipping local config JSON (already exists): %s", filename)
                 continue
             shutil.copy2(src, dst)
             copied_json += 1
