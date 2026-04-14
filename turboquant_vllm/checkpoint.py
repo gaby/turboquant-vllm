@@ -101,7 +101,7 @@ def save_tq3_checkpoint(
         logger.info("Using local checkpoint at %s", model_id)
     else:
         logger.info("Downloading config and tokenizer for %s...", model_id)
-    logger.info("Saving config and tokenizer to %s", output_dir)
+    logger.info("Saving config and tokenizer into %s...", output_dir)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Do NOT inject quantization_config into config.json — vLLM

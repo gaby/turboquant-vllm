@@ -11,6 +11,7 @@ assert that huggingface_hub is never touched and that a local-path call
 discovers shards from the filesystem.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -37,8 +38,6 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             save_file({"model.layers.0.mlp.fake.weight": weight}, source_shard)
 
             # Fake config.json so AutoConfig.from_pretrained works
-            import json
-
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump(
                     {
@@ -91,8 +90,6 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
             # config.json but no safetensors
-            import json
-
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump({"model_type": "bert"}, f)
             with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
@@ -123,8 +120,6 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                 },
                 os.path.join(srcdir, "model-00001-of-00001.safetensors"),
             )
-
-            import json
 
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump({"model_type": "bert", "vocab_size": 10}, f)
@@ -162,8 +157,6 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                 {"model.layers.0.mlp.fake.weight": torch.randn(8, 8)},
                 os.path.join(srcdir, "model-00001-of-00001.safetensors"),
             )
-
-            import json
 
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump({"model_type": "bert", "vocab_size": 10}, f)
