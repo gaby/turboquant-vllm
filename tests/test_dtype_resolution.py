@@ -15,7 +15,7 @@ class TestDtypeResolution(unittest.TestCase):
 
     def test_resolve_fp8_alias_when_available(self):
         resolved = resolve_torch_dtype("fp8")
-        if hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e5m2"):
+        if hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz") or hasattr(torch, "float8_e5m2"):
             self.assertIsNotNone(resolved)
             self.assertIn("float8", str(resolved))
         else:

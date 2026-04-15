@@ -147,16 +147,6 @@ def save_tq3_checkpoint(
         select_bits,
     )
 
-    low_precision_weight_dtypes = {
-        dtype
-        for alias in ("fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4", "fp4")
-        for dtype in [resolve_torch_dtype(alias)]
-        if dtype is not None
-    }
-
-    def _is_fp8_or_fp4_dtype(dtype: torch.dtype | None) -> bool:
-        return dtype in low_precision_weight_dtypes
-
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
     # Create second quantizer for sensitive layers if needed
     sensitive_quantizer = (
@@ -175,7 +165,6 @@ def save_tq3_checkpoint(
     total_compressed = 0
     compressed_count = 0
     source_weight_dtype: torch.dtype | None = resolve_torch_dtype(getattr(config, "torch_dtype", None))
-    mixed_weight_dtype_warned = False
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -216,22 +205,6 @@ def save_tq3_checkpoint(
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for tensor_name in f.keys():
                 tensor = f.get_tensor(tensor_name)
-                if tensor.is_floating_point() and source_weight_dtype is None:
-                    source_weight_dtype = tensor.dtype
-                elif (
-                    tensor.is_floating_point()
-                    and source_weight_dtype is not None
-                    and tensor.dtype != source_weight_dtype
-                    and not mixed_weight_dtype_warned
-                ):
-                    mixed_weight_dtype_warned = True
-                    logger.warning(
-                        "Mixed floating-point dtypes detected in source checkpoint (%s and %s); "
-                        "using %s for tq_config weight_dtype metadata",
-                        source_weight_dtype,
-                        tensor.dtype,
-                        source_weight_dtype,
-                    )
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
@@ -242,6 +215,8 @@ def save_tq3_checkpoint(
                 is_large = tensor.shape[-1] >= 128 or (tensor.dim() >= 2 and tensor.shape[-2] >= 128)
 
                 if is_weight and not is_skip and is_large:
+                    if tensor.is_floating_point() and source_weight_dtype is None:
+                        source_weight_dtype = tensor.dtype
                     tensor_bits = select_bits(tensor_name, bits, sensitive_bits)
                     tensor_quantizer = (
                         sensitive_quantizer if tensor_bits != bits and sensitive_quantizer is not None else quantizer
@@ -261,11 +236,13 @@ def save_tq3_checkpoint(
                             (total_original - total_compressed) / 1e9,
                         )
                 else:
+                    # Non-compressed tensors: store as FP16 (for floating-point) or
+                    # preserve the original dtype (for integer types). Do NOT use
+                    # source_weight_dtype here — it reflects weight tensors and
+                    # must not be used to cast unrelated tensors such as norms
+                    # or biases to FP8/FP4.
                     if tensor.is_floating_point():
-                        if _is_fp8_or_fp4_dtype(source_weight_dtype):
-                            stored_tensor = tensor.to(source_weight_dtype)
-                        else:
-                            stored_tensor = tensor.half()
+                        stored_tensor = tensor.half()
                     else:
                         stored_tensor = tensor
                     _add_tensor(tensor_name, stored_tensor)
@@ -569,8 +546,6 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         bias = loaded.get(mod_path + ".bias")
 
         meta_module = _resolve_module(model, mod_path)
-        meta_weight = getattr(meta_module, "weight", None)
-        wrapper_weight_dtype = getattr(meta_weight, "dtype", weight_dtype)
         tensor_bits = select_bits(weight_name, bits, sensitive_bits, sensitive_patterns)
         wrapper = TurboQuantWrapper.from_packed(
             packed,
@@ -580,7 +555,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             bits=tensor_bits,
             group_size=group_size,
             bias=bias,
-            weight_dtype=wrapper_weight_dtype,
+            weight_dtype=weight_dtype,
         )
 
         parent, attr = _resolve_parent_and_attr(model, mod_path)

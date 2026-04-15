@@ -41,7 +41,7 @@ _use_qjl = False
 _sink_tokens = 4  # first N positions per layer stored at FP16
 _boundary_layers = 5  # first/last N layers get higher K precision
 _total_layers = 0  # set during patching from model config
-_fp16_heads: set[int] = set()  # head indices to keep at cache dtype passthrough (sink heads)
+_fp16_heads: set[int] = set()  # head indices to keep in FP16 passthrough (sink heads)
 _rotation = "wht"  # 'wht' or 'planar'
 _layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
 _layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
@@ -174,13 +174,13 @@ def _make_patched_cache_update(original_fn):
             _layer_token_counts[layer_id] += 1
 
             if pos < _sink_tokens:
-                # Sink positions: store as None to signal cache-dtype passthrough
+                # Sink positions: store as None to signal FP16 passthrough
                 _cache[layer_id][(block_idx, offset, 0)] = None
                 continue
 
             for h in range(num_kv_heads):
                 if h in _fp16_heads:
-                    # Sink head: store as None (cache-dtype passthrough)
+                    # Sink head: store as None (FP16 passthrough)
                     _cache[layer_id][(block_idx, offset, h)] = None
                     continue
                 ck = compressor.compress_k(key[t, h].unsqueeze(0))

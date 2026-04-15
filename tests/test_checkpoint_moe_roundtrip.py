@@ -217,7 +217,7 @@ class TestCheckpointMoERoundTrip(unittest.TestCase):
 
     def test_tq_config_written(self):
         """tq_config.json must be written with correct metadata."""
-        ckpt_dir, _, _ = self._create_fake_checkpoint()
+        ckpt_dir, orig_w13, _ = self._create_fake_checkpoint()
         output_dir = os.path.join(self.tmpdir, "tq3_output3")
 
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
