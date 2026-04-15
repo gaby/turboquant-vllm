@@ -96,7 +96,10 @@ def save_tq3_checkpoint(
         if logger.isEnabledFor(logging.INFO):
             logger.info(msg, *args)
             return
-        text = msg % args if args else msg
+        try:
+            text = msg % args if args else msg
+        except (TypeError, ValueError):
+            text = f"{msg} {args}".rstrip()
         print(f"[turboquant_vllm.checkpoint] {text}")
 
     os.makedirs(output_dir, exist_ok=True)

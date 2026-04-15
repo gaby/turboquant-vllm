@@ -183,7 +183,7 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             with open(copied_path) as f:
                 self.assertEqual(json.load(f), custom_json)
 
-    def test_progress_falls_back_to_print_when_info_logs_disabled(self):
+    def test_progress_print_fallback_without_info_logging(self):
         """Progress should still be visible when INFO logging is disabled (e.g., REPL defaults)."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
