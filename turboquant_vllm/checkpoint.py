@@ -165,6 +165,7 @@ def save_tq3_checkpoint(
     total_compressed = 0
     compressed_count = 0
     source_weight_dtype: torch.dtype | None = resolve_torch_dtype(getattr(config, "torch_dtype", None))
+    observed_weight_dtypes: set[torch.dtype] = set()
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -215,8 +216,10 @@ def save_tq3_checkpoint(
                 is_large = tensor.shape[-1] >= 128 or (tensor.dim() >= 2 and tensor.shape[-2] >= 128)
 
                 if is_weight and not is_skip and is_large:
-                    if tensor.is_floating_point() and source_weight_dtype is None:
-                        source_weight_dtype = tensor.dtype
+                    if tensor.is_floating_point():
+                        observed_weight_dtypes.add(tensor.dtype)
+                        if source_weight_dtype is None:
+                            source_weight_dtype = tensor.dtype
                     tensor_bits = select_bits(tensor_name, bits, sensitive_bits)
                     tensor_quantizer = (
                         sensitive_quantizer if tensor_bits != bits and sensitive_quantizer is not None else quantizer
@@ -286,6 +289,18 @@ def save_tq3_checkpoint(
         # Single shard: rename to model.safetensors
         shard_path = os.path.join(output_dir, list(set(weight_map.values()))[0])
         os.rename(shard_path, os.path.join(output_dir, "model.safetensors"))
+
+    # Warn if weight tensors had mixed floating-point dtypes — the serialized
+    # weight_dtype metadata may not be representative of all compressed weights.
+    if len(observed_weight_dtypes) > 1:
+        dtype_names = sorted(str(d) for d in observed_weight_dtypes)
+        logger.warning(
+            "Mixed floating-point dtypes detected among weight tensors: %s. "
+            "Serializing weight_dtype=%s (from first weight tensor). "
+            "This may produce incorrect dtype metadata if weights have heterogeneous dtypes.",
+            dtype_names,
+            source_weight_dtype,
+        )
 
     tq_config = {
         "format": "tq3_native",
