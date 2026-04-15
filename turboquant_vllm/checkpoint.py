@@ -140,7 +140,18 @@ def save_tq3_checkpoint(
         if not shard_files:
             raise FileNotFoundError(f"No .safetensors shards found in HuggingFace repo {model_id}")
 
-    from turboquant_vllm.weight_quant import select_bits, _SENSITIVE_PATTERNS
+    from turboquant_vllm.weight_quant import (
+        _SENSITIVE_PATTERNS,
+        dtype_to_config_name,
+        resolve_torch_dtype,
+        select_bits,
+    )
+
+    def _is_fp8_or_fp4_dtype(dtype: torch.dtype | None) -> bool:
+        if dtype is None:
+            return False
+        name = str(dtype)
+        return "float8" in name or "float4" in name
 
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
     # Create second quantizer for sensitive layers if needed
@@ -159,6 +170,7 @@ def save_tq3_checkpoint(
     total_original = 0
     total_compressed = 0
     compressed_count = 0
+    source_weight_dtype: torch.dtype | None = resolve_torch_dtype(getattr(config, "torch_dtype", None))
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -199,6 +211,8 @@ def save_tq3_checkpoint(
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for tensor_name in f.keys():
                 tensor = f.get_tensor(tensor_name)
+                if tensor.is_floating_point() and source_weight_dtype is None:
+                    source_weight_dtype = tensor.dtype
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
@@ -229,7 +243,10 @@ def save_tq3_checkpoint(
                         )
                 else:
                     if tensor.is_floating_point():
-                        stored_tensor = tensor.half()
+                        if _is_fp8_or_fp4_dtype(source_weight_dtype):
+                            stored_tensor = tensor.to(source_weight_dtype)
+                        else:
+                            stored_tensor = tensor.half()
                     else:
                         stored_tensor = tensor
                     _add_tensor(tensor_name, stored_tensor)
@@ -280,6 +297,7 @@ def save_tq3_checkpoint(
         "format": "tq3_native",
         "bits": bits,
         "group_size": group_size,
+        "weight_dtype": dtype_to_config_name(source_weight_dtype),
         "quantizer_seed": 42,
         "compressed_layers": compressed_count,
         "original_model": model_id,
@@ -415,6 +433,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         Compressed3D,
         _register_moe_hooks,
         _get_quantizer,
+        resolve_torch_dtype,
         select_bits,
         _SENSITIVE_PATTERNS,
     )
@@ -424,6 +443,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         tq_config = json.load(f)
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
+    weight_dtype = resolve_torch_dtype(tq_config.get("weight_dtype"), default=torch.float16)
     sensitive_bits = tq_config.get("sensitive_bits")
     sensitive_patterns = tuple(tq_config.get("sensitive_patterns", _SENSITIVE_PATTERNS))
 
@@ -431,7 +451,14 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     logger.info("Creating model skeleton on meta device...")
     config = AutoConfig.from_pretrained(checkpoint_dir)
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config, dtype=torch.float16)
+        try:
+            model = AutoModelForCausalLM.from_config(config, dtype=weight_dtype)
+        except Exception:
+            if weight_dtype != torch.float16:
+                logger.warning(
+                    "Could not initialize model with dtype %s, falling back to torch.float16", weight_dtype
+                )
+            model = AutoModelForCausalLM.from_config(config, dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
 
     # Step 2: Build inventory of checkpoint tensors
@@ -528,6 +555,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             bits=tensor_bits,
             group_size=group_size,
             bias=bias,
+            weight_dtype=getattr(getattr(meta_module, "weight", None), "dtype", weight_dtype),
         )
 
         parent, attr = _resolve_parent_and_attr(model, mod_path)
@@ -561,11 +589,12 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         norms = loaded[base_name + ".tq_norms"]
 
         tensor_bits = select_bits(base_name, bits, sensitive_bits, sensitive_patterns)
+        target_dtype = getattr(meta_param, "dtype", weight_dtype)
         compressed = Compressed3D.from_packed(
             packed,
             norms,
             shape=tuple(orig_shape),
-            dtype=torch.float16,
+            dtype=target_dtype,
             bits=tensor_bits,
             group_size=group_size,
         )
@@ -574,10 +603,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         if isinstance(meta_param, nn.Parameter):
             owner.register_parameter(
                 param_name,
-                nn.Parameter(torch.empty(0, device=device, dtype=torch.float16), requires_grad=False),
+                nn.Parameter(torch.empty(0, device=device, dtype=target_dtype), requires_grad=False),
             )
         else:
-            setattr(owner, param_name, torch.empty(0, device=device, dtype=torch.float16))
+            setattr(owner, param_name, torch.empty(0, device=device, dtype=target_dtype))
 
         mod_id = id(owner)
         if mod_id not in modules_to_hook:
@@ -653,7 +682,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 out_features, in_features = meta_param.shape
                 padded_in = ((in_features + group_size - 1) // group_size) * group_size
                 decompressed = w_groups.reshape(out_features, padded_in)[:, :in_features]
-                decompressed = decompressed.to(torch.float16)
+                decompressed = decompressed.to(meta_param.dtype)
                 if isinstance(meta_param, nn.Parameter):
                     owner.register_parameter(
                         param_name,
@@ -741,11 +770,12 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             stacked_norms = torch.cat(all_norms, dim=0)
 
             target_bits = select_bits(target_key, bits, sensitive_bits, sensitive_patterns)
+            target_dtype = getattr(meta_param, "dtype", weight_dtype)
             compressed = Compressed3D.from_packed(
                 stacked_packed,
                 stacked_norms,
                 shape=tuple(orig_shape),
-                dtype=torch.float16,
+                dtype=target_dtype,
                 bits=target_bits,
                 group_size=group_size,
             )
@@ -754,10 +784,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             if isinstance(meta_param, nn.Parameter):
                 owner.register_parameter(
                     param_name,
-                    nn.Parameter(torch.empty(0, device=device, dtype=torch.float16), requires_grad=False),
+                    nn.Parameter(torch.empty(0, device=device, dtype=target_dtype), requires_grad=False),
                 )
             else:
-                setattr(owner, param_name, torch.empty(0, device=device, dtype=torch.float16))
+                setattr(owner, param_name, torch.empty(0, device=device, dtype=target_dtype))
 
             mod_id = id(owner)
             if mod_id not in modules_to_hook:
@@ -789,14 +819,14 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
 
         if isinstance(target, nn.Parameter):
             if data.is_floating_point():
-                data = data.to(torch.float16)
+                data = data.to(target.dtype)
             target_module.register_parameter(
                 attr_name,
                 nn.Parameter(data, requires_grad=False),
             )
         else:
             if hasattr(target, "data") and target.is_floating_point():
-                data = data.to(torch.float16)
+                data = data.to(target.dtype)
             setattr(target_module, attr_name, data)
         regular_loaded += 1
 

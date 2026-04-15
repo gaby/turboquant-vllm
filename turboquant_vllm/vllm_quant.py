@@ -71,7 +71,14 @@ def register():
             return "turboquant"
 
         def get_supported_act_dtypes(self) -> list[torch.dtype]:
-            return [torch.float16, torch.bfloat16]
+            from turboquant_vllm.weight_quant import resolve_torch_dtype
+
+            dtypes = [torch.float16, torch.bfloat16]
+            for name in ("fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4", "fp4"):
+                dtype = resolve_torch_dtype(name)
+                if dtype is not None and dtype not in dtypes:
+                    dtypes.append(dtype)
+            return dtypes
 
         @classmethod
         def get_min_capability(cls) -> int:
@@ -437,6 +444,10 @@ def _patch_weight_name_remapping():
             tq_cfg = _json.load(f)
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
+        from turboquant_vllm.weight_quant import resolve_torch_dtype
+
+        default_dtype = resolve_torch_dtype(getattr(model_config, "dtype", None), default=torch.bfloat16)
+        weight_dtype = resolve_torch_dtype(tq_cfg.get("weight_dtype"), default=default_dtype)
         logger.info(
             "TQ3 native checkpoint (bits=%d, group_size=%d): "
             "single-pass decompress-on-load",
@@ -468,7 +479,7 @@ def _patch_weight_name_remapping():
                 in_dim = n_groups * group_size
                 comp = Compressed3D.from_packed(
                     packed, norms, (1, n_rows, in_dim),
-                    torch.bfloat16, bits, group_size,
+                    weight_dtype, bits, group_size,
                 )
                 w = comp.decompress().squeeze(0)
                 decompressed += 1

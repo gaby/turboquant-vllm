@@ -236,6 +236,7 @@ class TestCheckpointMoERoundTrip(unittest.TestCase):
         self.assertEqual(tq_config["bits"], self.bits)
         self.assertEqual(tq_config["group_size"], self.group_size)
         self.assertEqual(tq_config["format"], "tq3_native")
+        self.assertEqual(tq_config["weight_dtype"], "float32")
         self.assertGreater(tq_config["compressed_layers"], 0)
 
 

@@ -42,7 +42,7 @@ class TurboQuantFusedMoEScratchPool:
     """Shared dequant scratch buffers for all FusedMoE layers in a model.
 
     Only one MoE layer runs at a time during forward, so one set of
-    bf16 destinations + fp32 intermediates is enough regardless of
+    low-precision destinations + fp32 intermediates is enough regardless of
     layer count. Per-layer scratch would hold the uncompressed expert
     weights on the side for every layer and defeat the compression.
     All FusedMoE layers in a model are assumed to share the same
@@ -53,9 +53,9 @@ class TurboQuantFusedMoEScratchPool:
 
     def __init__(self, w13_compressed, w2_compressed):
         device = w13_compressed.packed.device
-        bf16_dtype = w13_compressed.dtype
-        self.w13 = torch.empty(w13_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w2 = torch.empty(w2_compressed.shape, dtype=bf16_dtype, device=device)
+        weight_dtype = w13_compressed.dtype
+        self.w13 = torch.empty(w13_compressed.shape, dtype=weight_dtype, device=device)
+        self.w2 = torch.empty(w2_compressed.shape, dtype=weight_dtype, device=device)
         self.w13_fp32 = torch.empty(w13_compressed.shape, dtype=torch.float32, device=device)
         self.w2_fp32 = torch.empty(w2_compressed.shape, dtype=torch.float32, device=device)
         self.shape_w13 = w13_compressed.shape

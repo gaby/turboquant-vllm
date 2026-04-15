@@ -36,6 +36,48 @@ _tq_fused_gemm_fn = None
 _tq_fwht_input_fn = None
 
 
+_DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "float16": ("float16", "half"),
+    "half": ("float16", "half"),
+    "bfloat16": ("bfloat16",),
+    "float32": ("float32", "float"),
+    "float": ("float32", "float"),
+    "fp8": ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2"),
+    "fp8_e4m3": ("float8_e4m3fn", "float8_e4m3fnuz"),
+    "fp8_e5m2": ("float8_e5m2",),
+    "nvfp4": ("float4_e2m1fn_x2", "float4_e2m1fn"),
+    "fp4": ("float4_e2m1fn_x2", "float4_e2m1fn"),
+}
+
+
+def resolve_torch_dtype(dtype: torch.dtype | str | None, default: torch.dtype | None = None) -> torch.dtype | None:
+    """Resolve torch dtype from torch.dtype or common string aliases.
+
+    Returns ``default`` when the requested dtype is unavailable in this torch build.
+    """
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype is None:
+        return default
+
+    key = str(dtype).strip().lower()
+    key = key.replace("torch.", "")
+
+    for attr in _DTYPE_ALIASES.get(key, (key,)):
+        maybe = getattr(torch, attr, None)
+        if isinstance(maybe, torch.dtype):
+            return maybe
+    return default
+
+
+def dtype_to_config_name(dtype: torch.dtype | str | None, fallback: str = "float16") -> str:
+    """Return a stable dtype string for tq_config metadata."""
+    resolved = resolve_torch_dtype(dtype)
+    if resolved is None:
+        return fallback
+    return str(resolved).replace("torch.", "")
+
+
 def _ensure_triton_backends() -> bool:
     """Lazy-load Triton kernel functions on first use.
 
@@ -358,6 +400,7 @@ class TurboQuantWrapper(nn.Module):
         bits: int = 3,
         group_size: int = 128,
         bias: torch.Tensor | None = None,
+        weight_dtype: torch.dtype = torch.float16,
     ):
         """Create a TurboQuantWrapper from pre-packed data (native TQ3 checkpoint).
 
@@ -377,7 +420,7 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("norms", norms)
         wrapper.bias = nn.Parameter(bias) if bias is not None else None
 
-        original_bytes = out_features * in_features * 2  # FP16 equivalent
+        original_bytes = out_features * in_features * weight_dtype.itemsize
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
         wrapper._ratio = original_bytes / max(compressed_bytes, 1)
 
@@ -520,7 +563,7 @@ class Compressed3D:
         self.norms = norms.reshape(n_experts * out_dim, self.n_groups)
 
         self.original_bytes = data.numel() * data.element_size()
-        self.compressed_bytes = self.packed.numel() + self.norms.numel() * 4
+        self.compressed_bytes = self.packed.numel() + self.norms.numel() * self.norms.element_size()
 
     @classmethod
     def from_packed(
@@ -547,8 +590,8 @@ class Compressed3D:
         obj.padded_in, obj.n_groups = padded_size(in_dim, group_size)
         obj.packed = packed
         obj.norms = norms
-        obj.original_bytes = n_experts * out_dim * in_dim * 2  # FP16
-        obj.compressed_bytes = packed.numel() + norms.numel() * 4
+        obj.original_bytes = n_experts * out_dim * in_dim * dtype.itemsize
+        obj.compressed_bytes = packed.numel() + norms.numel() * norms.element_size()
         return obj
 
     def decompress_into(
