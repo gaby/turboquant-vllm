@@ -92,25 +92,15 @@ def save_tq3_checkpoint(
     from transformers import AutoConfig, AutoTokenizer
     from turboquant_vllm.torch_ops import PolarQuantTorch
 
-    def _progress(msg: str, *args):
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(msg, *args)
-            return
-        try:
-            text = msg % args if args else msg
-        except (TypeError, ValueError):
-            text = f"{msg} {args}".rstrip()
-        print(f"[turboquant_vllm.checkpoint] {text}")
-
     os.makedirs(output_dir, exist_ok=True)
 
     # Accept either a HuggingFace model ID or a local path. A local path
     # skips hf_hub entirely; the HF path downloads shards on demand.
     is_local = os.path.isdir(model_id)
     if is_local:
-        _progress("Using local checkpoint at %s", model_id)
+        logger.info("Using local checkpoint at %s", model_id)
     else:
-        _progress("Downloading config and tokenizer for %s...", model_id)
+        logger.info("Downloading config and tokenizer for %s...", model_id)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Do NOT inject quantization_config into config.json — vLLM
@@ -122,7 +112,7 @@ def save_tq3_checkpoint(
         config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    _progress("Saved config and tokenizer to %s", output_dir)
+    logger.info("Saved config and tokenizer to %s", output_dir)
     if is_local:
         copied_json = 0
         for filename in sorted(os.listdir(model_id)):
@@ -133,15 +123,15 @@ def save_tq3_checkpoint(
             if not os.path.isfile(src):
                 continue
             if os.path.exists(dst):
-                _progress("Skipping local config JSON (already exists): %s", filename)
+                logger.info("Skipping local config JSON (already exists): %s", filename)
                 continue
             shutil.copy2(src, dst)
             copied_json += 1
-            _progress("Copied local config JSON: %s", filename)
+            logger.info("Copied local config JSON: %s", filename)
         if copied_json > 0:
-            _progress("Copied %d additional local JSON config file(s)", copied_json)
+            logger.info("Copied %d additional local JSON config file(s)", copied_json)
         else:
-            _progress("No additional local JSON config files to copy")
+            logger.info("No additional local JSON config files to copy")
 
     if is_local:
         shard_files = sorted(f for f in os.listdir(model_id) if f.endswith(".safetensors"))
@@ -184,7 +174,7 @@ def save_tq3_checkpoint(
         save_file(current_shard, shard_path)
         for name in current_shard:
             weight_map[name] = shard_name
-        _progress("  Wrote shard %d: %d tensors, %.1f GB", shard_idx, len(current_shard), current_shard_bytes / 1e9)
+        logger.info("  Wrote shard %d: %d tensors, %.1f GB", shard_idx, len(current_shard), current_shard_bytes / 1e9)
         current_shard = {}
         current_shard_bytes = 0
 
@@ -202,7 +192,7 @@ def save_tq3_checkpoint(
     _tmp_download_dir = None if is_local else tempfile.mkdtemp(prefix="tq3_dl_")
 
     for shard_name in shard_files:
-        _progress("Processing shard: %s", shard_name)
+        logger.info("Processing shard: %s", shard_name)
         if is_local:
             shard_path = os.path.join(model_id, shard_name)
         else:
@@ -236,7 +226,7 @@ def save_tq3_checkpoint(
                     compressed_count += 1
 
                     if compressed_count % 200 == 0:
-                        _progress(
+                        logger.info(
                             "  Compressed %d tensors (%.1f GB saved so far)",
                             compressed_count,
                             (total_original - total_compressed) / 1e9,
@@ -303,7 +293,7 @@ def save_tq3_checkpoint(
         json.dump(tq_config, f, indent=2)
 
     ratio = total_original / max(total_compressed, 1)
-    _progress(
+    logger.info(
         "TQ3 checkpoint saved: %.1f GB -> %.1f GB (%.1fx), %d layers compressed",
         total_original / 1e9,
         total_compressed / 1e9,
