@@ -128,7 +128,10 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
                 f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
 
-            with mock.patch("turboquant_vllm.checkpoint.logger.info") as mock_info:
+            with (
+                mock.patch("turboquant_vllm.checkpoint.logger.isEnabledFor", return_value=True),
+                mock.patch("turboquant_vllm.checkpoint.logger.info") as mock_info,
+            ):
                 save_tq3_checkpoint(
                     model_id=srcdir,
                     output_dir=outdir,
@@ -179,6 +182,41 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             self.assertTrue(os.path.exists(copied_path), "Expected custom local JSON config to be copied")
             with open(copied_path) as f:
                 self.assertEqual(json.load(f), custom_json)
+
+    def test_progress_falls_back_to_print_when_info_logs_disabled(self):
+        """Progress should still be visible when INFO logging is disabled (e.g., REPL defaults)."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+
+            save_file(
+                {"model.layers.0.mlp.fake.weight": torch.randn(8, 8)},
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump({"model_type": "bert", "vocab_size": 10}, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            with (
+                mock.patch("turboquant_vllm.checkpoint.logger.isEnabledFor", return_value=False),
+                mock.patch("builtins.print") as mock_print,
+            ):
+                save_tq3_checkpoint(
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,
+                )
+
+            printed_messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+            self.assertTrue(
+                any("TQ3 checkpoint saved:" in message for message in printed_messages),
+                "Expected fallback progress print when INFO logs are disabled",
+            )
 
 
 if __name__ == "__main__":
