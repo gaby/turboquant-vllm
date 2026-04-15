@@ -147,11 +147,15 @@ def save_tq3_checkpoint(
         select_bits,
     )
 
+    low_precision_weight_dtypes = {
+        dtype
+        for alias in ("fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4", "fp4")
+        for dtype in [resolve_torch_dtype(alias)]
+        if dtype is not None
+    }
+
     def _is_fp8_or_fp4_dtype(dtype: torch.dtype | None) -> bool:
-        if dtype is None:
-            return False
-        name = str(dtype)
-        return "float8" in name or "float4" in name
+        return dtype in low_precision_weight_dtypes
 
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
     # Create second quantizer for sensitive layers if needed
@@ -171,6 +175,7 @@ def save_tq3_checkpoint(
     total_compressed = 0
     compressed_count = 0
     source_weight_dtype: torch.dtype | None = resolve_torch_dtype(getattr(config, "torch_dtype", None))
+    mixed_weight_dtype_warned = False
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -213,6 +218,20 @@ def save_tq3_checkpoint(
                 tensor = f.get_tensor(tensor_name)
                 if tensor.is_floating_point() and source_weight_dtype is None:
                     source_weight_dtype = tensor.dtype
+                elif (
+                    tensor.is_floating_point()
+                    and source_weight_dtype is not None
+                    and tensor.dtype != source_weight_dtype
+                    and not mixed_weight_dtype_warned
+                ):
+                    mixed_weight_dtype_warned = True
+                    logger.warning(
+                        "Mixed floating-point dtypes detected in source checkpoint (%s and %s); "
+                        "using %s for tq_config weight_dtype metadata",
+                        source_weight_dtype,
+                        tensor.dtype,
+                        source_weight_dtype,
+                    )
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
@@ -453,10 +472,14 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     with torch.device("meta"):
         try:
             model = AutoModelForCausalLM.from_config(config, dtype=weight_dtype)
-        except Exception:
+        except (TypeError, ValueError, RuntimeError) as e:
             if weight_dtype != torch.float16:
                 logger.warning(
-                    "Could not initialize model with dtype %s, falling back to torch.float16", weight_dtype
+                    "Could not initialize model with requested dtype %s (%s: %s); "
+                    "falling back to torch.float16 for skeleton init",
+                    weight_dtype,
+                    type(e).__name__,
+                    e,
                 )
             model = AutoModelForCausalLM.from_config(config, dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
@@ -546,6 +569,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         bias = loaded.get(mod_path + ".bias")
 
         meta_module = _resolve_module(model, mod_path)
+        meta_weight = getattr(meta_module, "weight", None)
+        wrapper_weight_dtype = getattr(meta_weight, "dtype", weight_dtype)
         tensor_bits = select_bits(weight_name, bits, sensitive_bits, sensitive_patterns)
         wrapper = TurboQuantWrapper.from_packed(
             packed,
@@ -555,7 +580,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             bits=tensor_bits,
             group_size=group_size,
             bias=bias,
-            weight_dtype=getattr(getattr(meta_module, "weight", None), "dtype", weight_dtype),
+            weight_dtype=wrapper_weight_dtype,
         )
 
         parent, attr = _resolve_parent_and_attr(model, mod_path)

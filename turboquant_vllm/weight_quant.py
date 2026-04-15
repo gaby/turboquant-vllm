@@ -53,6 +53,13 @@ _DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
 def resolve_torch_dtype(dtype: torch.dtype | str | None, default: torch.dtype | None = None) -> torch.dtype | None:
     """Resolve torch dtype from torch.dtype or common string aliases.
 
+    Alias precedence follows the tuple order in ``_DTYPE_ALIASES``.
+    For example, ``fp8`` prefers e4m3 over e5m2 when both are available.
+
+    When ``default`` is provided it is returned if the dtype cannot be resolved.
+    When ``default`` is ``None``, unresolved dtypes return ``None``.
+    Unknown dtype strings are treated as unresolved and also return ``default``.
+
     Returns ``default`` when the requested dtype is unavailable in this torch build.
     """
     if isinstance(dtype, torch.dtype):
