@@ -564,6 +564,14 @@ def register():
     logger.info("TurboQuant quantization config registered with vLLM")
 
 
+# FP8 metadata that survives a re-quantization to TQ3 as dead bytes.
+_FP8_LEFTOVER_SCALE_SUFFIXES = (
+    ".weight_scale_inv",
+    ".weight_scale",
+    ".input_scale",
+)
+
+
 def _patch_weight_name_remapping():
     """Monkey-patch vLLM's weight iterator to decompress TQ3 weights on load.
 
@@ -632,6 +640,7 @@ def _patch_weight_name_remapping():
         pending_packed: dict[str, torch.Tensor] = {}
         pending_norms: dict[str, torch.Tensor] = {}
         decompressed = 0
+        skipped_fp8_scales = 0
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".weight.tq_packed"):
@@ -640,6 +649,9 @@ def _patch_weight_name_remapping():
             elif name.endswith(".weight.tq_norms"):
                 base = name[: -len(".tq_norms")]
                 pending_norms[base] = tensor
+            elif name.endswith(_FP8_LEFTOVER_SCALE_SUFFIXES):
+                skipped_fp8_scales += 1
+                continue
             else:
                 yield name, tensor
                 continue
@@ -669,6 +681,11 @@ def _patch_weight_name_remapping():
 
         if decompressed > 0:
             logger.info("TQ3 decompression complete: %d tensors", decompressed)
+        if skipped_fp8_scales > 0:
+            logger.info(
+                "TQ3 native: dropped %d FP8 leftover scale tensors",
+                skipped_fp8_scales,
+            )
 
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
