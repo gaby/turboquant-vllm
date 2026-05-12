@@ -31,8 +31,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Layers to keep at full precision
-_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
+# Layers to keep at full precision. Kept in sync with weight_quant._SKIP_PATTERNS.
+# `conv1d` is critical for Qwen3-Next / Qwen3.5 / Qwen3.6-A3B family (GatedDeltaNet /
+# linear-attention conv blocks): quantizing those weights silently corrupts outputs.
+# PR #31 added conv1d to weight_quant.py's runtime version; this file was missed,
+# letting save_tq3_checkpoint still quantize conv1d into native packed checkpoints.
+_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head", "conv1d")
 
 
 def _resolve_module(root, dotted_path: str):
