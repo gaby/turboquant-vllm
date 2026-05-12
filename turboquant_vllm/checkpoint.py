@@ -133,6 +133,7 @@ def save_tq3_checkpoint(
         # the base model is multimodal — e.g. Qwen3.6-35B-A3B fails with
         # OSError: Can't load image processor for ... missing preprocessor_config.json.
         from huggingface_hub import hf_hub_download
+
         sibling_configs = (
             "preprocessor_config.json",
             "image_processor_config.json",
