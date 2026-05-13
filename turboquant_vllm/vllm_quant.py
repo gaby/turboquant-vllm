@@ -418,31 +418,56 @@ def _materialize_meta_tensors(layer, label: str = ""):
     """
     target_device = "cuda" if torch.cuda.is_available() else "cpu"
     materialized: list[str] = []
+    failed: list[str] = []
 
     # Walk both Parameters and Buffers; cover the layer itself + any
     # sub-modules (named_parameters/named_buffers do the recursion).
-    def _walk(obj_name: str, item, is_param: bool):
+    # vLLM uses custom Parameter subclasses (ModelWeightParameter,
+    # ChannelQuantScaleParameter, etc.) with strict set_data layout checks,
+    # so a plain torch.zeros(...) replacement gets rejected with
+    # "variable and tensor have incompatible tensor type". Using empty_like
+    # preserves layout/dtype/options from the meta param; .to() is the
+    # fallback for the few subclasses that still reject empty_like.
+    def _walk(obj_name: str, item):
         if item is None or not isinstance(item, torch.Tensor):
             return
         if item.device.type != "meta":
             return
-        # Replace in place. For Parameters we need to swap .data; the wrapping
-        # nn.Parameter stays the same object, only its underlying storage moves.
-        replacement = torch.zeros(item.shape, dtype=item.dtype, device=target_device)
-        if isinstance(item, torch.nn.Parameter):
-            item.data = replacement
-        else:
-            # Buffer — re-register on the owning module.
-            # We can't easily find the owning module here without more wiring;
-            # log loudly so we can extend the walker if a buffer-only case shows up.
-            materialized.append(f"{obj_name} (BUFFER — manual rebind needed)")
+        if not isinstance(item, torch.nn.Parameter):
+            # Buffer — can't easily rebind without the owning module ref.
+            failed.append(f"{obj_name} (buffer; would need module-level reassign)")
             return
-        materialized.append(obj_name)
+        # Attempt 1: empty_like with target device — preserves layout/subclass.
+        try:
+            new_data = torch.empty_like(item, device=target_device)
+            new_data.zero_()
+            item.data = new_data
+            materialized.append(obj_name)
+            return
+        except RuntimeError:
+            pass
+        # Attempt 2: .to(device) — preserves Parameter subclass behavior on materialization.
+        try:
+            new_data = item.to(device=target_device)
+            if new_data.device.type == "meta":  # to() refused
+                raise RuntimeError("to(device) returned meta tensor")
+            new_data.zero_()
+            item.data = new_data
+            materialized.append(f"{obj_name} (via .to())")
+            return
+        except RuntimeError as e:
+            failed.append(f"{obj_name} (rejected: {e})")
 
     for name, param in layer.named_parameters(recurse=True):
-        _walk(f"param:{name}", param, is_param=True)
+        _walk(f"param:{name}", param)
     for name, buf in layer.named_buffers(recurse=True):
-        _walk(f"buffer:{name}", buf, is_param=False)
+        _walk(f"buffer:{name}", buf)
+
+    if failed:
+        logger.warning(
+            "TurboQuant native-packed MoE finalize (%s): could not materialize %d tensors: %s",
+            label, len(failed), failed[:10],
+        )
 
     if materialized:
         logger.info(
