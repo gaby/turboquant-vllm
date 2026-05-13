@@ -153,6 +153,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_compressed,
         w2_compressed,
         scratch_pool: TurboQuantFusedMoEScratchPool,
+        base_method=None,
     ):
         if not _HAS_FUSED_MOE:
             raise RuntimeError(
@@ -166,6 +167,15 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self._w13 = w13_compressed
         self._w2 = w2_compressed
         self._pool = scratch_pool
+        self._base_method = base_method
+        if base_method is not None:
+            self.moe_kernel = getattr(base_method, "moe_kernel", None)
+            self.moe_quant_config = getattr(base_method, "moe_quant_config", None)
+
+    @property
+    def supports_eplb(self) -> bool:
+        base_method = self._base_method
+        return bool(getattr(base_method, "supports_eplb", False))
 
     # ------------------------------------------------------------------
     # Abstract methods from FusedMoEMethodBase
@@ -221,7 +231,8 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
         self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
 
-        return layer.base_quant_method.apply(
+        base_method = self._base_method or layer.base_quant_method
+        return base_method.apply(
             layer=layer,
             x=x,
             topk_weights=topk_weights,

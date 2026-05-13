@@ -615,7 +615,15 @@ def _finalize_native_packed_moe(
     _bind_real_weight_param("w2_weight", pool.w2)
     if _HAS_FUSED_MOE and hasattr(layer, "_replace_quant_method"):
         layer.base_quant_method = method._unquant
-        layer._replace_quant_method(TurboQuantFusedMoEMethod(layer.moe_config, w13_c, w2_c, pool))
+        layer._replace_quant_method(
+            TurboQuantFusedMoEMethod(
+                layer.moe_config,
+                w13_c,
+                w2_c,
+                pool,
+                base_method=method._unquant,
+            )
+        )
 
     # Full-coverage meta-tensor sweep. The earlier targeted walk (w13/w2/
     # expert_map/base_quant_method) only flagged the parameters PR #44 itself

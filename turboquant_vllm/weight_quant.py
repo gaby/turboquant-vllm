@@ -1378,7 +1378,14 @@ def _replace_linear_layers(
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.
-            new_method = TurboQuantFusedMoEMethod(module.moe_config, w13_c, w2_c, moe_scratch_pool)
+            base_method = getattr(module, "base_quant_method", getattr(module, "quant_method", None))
+            new_method = TurboQuantFusedMoEMethod(
+                module.moe_config,
+                w13_c,
+                w2_c,
+                moe_scratch_pool,
+                base_method=base_method,
+            )
             module._replace_quant_method(new_method)
             _moe_compressed_count += 1
 
