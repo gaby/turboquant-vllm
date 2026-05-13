@@ -32,6 +32,7 @@ from turboquant_vllm.vllm_quant import (
     _maybe_flush_native_moe_target,
     _regroup_native_moe_packed_tensors,
     _collect_meta_params,
+    _try_pre_fused_rename,
 )
 from turboquant_vllm.moe_quant import _HAS_FUSED_MOE
 
@@ -387,6 +388,41 @@ class TestNativeMoEPackedRegroup(unittest.TestCase):
 
         self.assertLess((w13_comp.decompress() - expected_w13).abs().max().item(), 2.0)
         self.assertLess((w2_comp.decompress() - expected_w2).abs().max().item(), 2.0)
+
+    def test_pre_fused_rename_handles_qwen36_layout(self):
+        """Qwen3.6 native checkpoints store experts pre-fused per layer:
+        `.experts.gate_up_proj.tq_packed` (no per-expert index), with or
+        without `.weight` suffix, and bare `w13`/`w2` aliases."""
+        prefix = "language_model.model.layers.5.mlp.experts"
+        cases = [
+            (f"{prefix}.gate_up_proj", f"{prefix}.w13_weight"),
+            (f"{prefix}.gate_up_proj.weight", f"{prefix}.w13_weight"),
+            (f"{prefix}.down_proj", f"{prefix}.w2_weight"),
+            (f"{prefix}.down_proj.weight", f"{prefix}.w2_weight"),
+            (f"{prefix}.w13", f"{prefix}.w13_weight"),
+            (f"{prefix}.w2", f"{prefix}.w2_weight"),
+            (f"{prefix}.w13_weight", f"{prefix}.w13_weight"),
+            (f"{prefix}.w2_weight", f"{prefix}.w2_weight"),
+        ]
+        for base, expected in cases:
+            self.assertEqual(_try_pre_fused_rename(base), expected, f"input={base!r}")
+
+    def test_pre_fused_rename_returns_none_for_per_expert_layout(self):
+        """Per-expert names (Qwen3-30B-A3B layout) must NOT match the
+        pre-fused dispatch so the existing regroup path handles them."""
+        per_expert_names = [
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.42.up_proj.weight",
+            "model.layers.0.mlp.experts.7.down_proj.weight",
+            "model.layers.0.mlp.experts.3.w1.weight",
+            # Unknown projections inside the .experts.<idx>. namespace
+            "model.layers.0.mlp.experts.0.unknown_proj.weight",
+            # Module names that look similar but aren't expert blocks
+            "model.layers.0.gate_up_proj.weight",
+            "language_model.lm_head.weight",
+        ]
+        for name in per_expert_names:
+            self.assertIsNone(_try_pre_fused_rename(name), f"input={name!r}")
 
     def test_incremental_native_moe_flush_emits_when_target_complete(self):
         model = _FakeRoot()

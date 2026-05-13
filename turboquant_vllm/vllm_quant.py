@@ -1041,19 +1041,38 @@ _FP8_LEFTOVER_SCALE_SUFFIXES = (
 )
 
 _EXPERT_INDEX_PATTERN = re.compile(r"^(.+?)\.experts\.(\d+)\.(.+)$")
-# Qwen3.6-style native-packed checkpoints store the per-layer experts
-# pre-fused on disk: `.experts.gate_up_proj.tq_packed` (gate+up stacked
-# across all experts) and `.experts.down_proj.tq_packed`. No per-expert
-# index, no `.weight.` — direct from disk → placeholder.
+# Qwen3.6-style native-packed checkpoints store per-layer experts pre-fused
+# on disk: `.experts.gate_up_proj.tq_packed` (gate+up stacked across all
+# experts) and `.experts.down_proj.tq_packed`. No per-expert index. The
+# optional `.weight` covers authors who saved with the suffix preserved.
+# Bare `w13`/`w2` aliases are safe in this path because pre-fused names
+# never carry an expert index (no collision with per-expert `experts.0.w2`).
 _NATIVE_MOE_PRE_FUSED_PATTERN = re.compile(
-    r"^(.+?\.experts)\.(gate_up_proj|down_proj|w13_weight|w2_weight)$"
+    r"^(.+?\.experts)\.(gate_up_proj|down_proj|w13_weight|w2_weight|w13|w2)(?:\.weight)?$"
 )
 _NATIVE_MOE_PRE_FUSED_TO_TARGET = {
     "gate_up_proj": "w13_weight",
     "down_proj": "w2_weight",
     "w13_weight": "w13_weight",
     "w2_weight": "w2_weight",
+    "w13": "w13_weight",
+    "w2": "w2_weight",
 }
+
+
+def _try_pre_fused_rename(base: str) -> str | None:
+    """Return the placeholder target path for an already-fused expert base.
+
+    Returns None when base doesn't match the pre-fused pattern (caller must
+    fall through to per-expert regroup).
+    """
+    m = _NATIVE_MOE_PRE_FUSED_PATTERN.match(base)
+    if not m:
+        return None
+    target = _NATIVE_MOE_PRE_FUSED_TO_TARGET.get(m.group(2))
+    if target is None:
+        return None
+    return f"{m.group(1)}.{target}"
 _NATIVE_MOE_PROJ_FUSION = {
     "gate_proj": "w13_weight",
     "up_proj": "w13_weight",
@@ -1392,20 +1411,6 @@ def _patch_weight_name_remapping():
             if mapper is None:
                 return n
             return mapper._map_name(n)
-
-        def _try_pre_fused_rename(base: str) -> str | None:
-            # Qwen3.6+ native-packed: experts on disk are pre-fused per layer
-            # (e.g. .experts.gate_up_proj.tq_packed); yield directly to the
-            # matching placeholder name so AutoWeightsLoader routes it to
-            # w13_weight_tq_packed without going through the per-expert
-            # regroup machinery.
-            m = _NATIVE_MOE_PRE_FUSED_PATTERN.match(base)
-            if not m:
-                return None
-            target = _NATIVE_MOE_PRE_FUSED_TO_TARGET.get(m.group(2))
-            if target is None:
-                return None
-            return f"{m.group(1)}.{target}"
 
         for raw_name, tensor in _original_get_all_weights(self, model_config, model):
             name = _map(raw_name)
