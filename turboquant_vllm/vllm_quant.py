@@ -420,52 +420,67 @@ def _materialize_meta_tensors(layer, label: str = ""):
     materialized: list[str] = []
     failed: list[str] = []
 
-    # Walk both Parameters and Buffers; cover the layer itself + any
-    # sub-modules (named_parameters/named_buffers do the recursion).
-    # vLLM uses custom Parameter subclasses (ModelWeightParameter,
-    # ChannelQuantScaleParameter, etc.) with strict set_data layout checks,
-    # so a plain torch.zeros(...) replacement gets rejected with
-    # "variable and tensor have incompatible tensor type". Using empty_like
-    # preserves layout/dtype/options from the meta param; .to() is the
-    # fallback for the few subclasses that still reject empty_like.
-    def _walk(obj_name: str, item):
-        if item is None or not isinstance(item, torch.Tensor):
+    # PyTorch's `empty_like(meta_tensor, device=cuda)` and `meta_tensor.to(cuda)`
+    # both fail with "Cannot copy out of meta tensor; no data!" — they take an
+    # internal copy path that requires the source's storage. The right idiom
+    # is `torch.empty(shape, dtype, device, layout)` directly: pure construction
+    # with no source-tensor data dependency.
+    #
+    # When .data swap is rejected by a subclass's strict set_data check
+    # (vLLM has many Parameter subclasses with custom layout assertions),
+    # fall back to replacing the whole Parameter object via the owning
+    # module's _parameters dict, preserving subclass type and weight_loader.
+    def _try_materialize(owner_module, attr_name, param):
+        if not isinstance(param, torch.nn.Parameter) or not param.is_meta:
             return
-        if item.device.type != "meta":
-            return
-        if not isinstance(item, torch.nn.Parameter):
-            # Buffer — can't easily rebind without the owning module ref.
-            failed.append(f"{obj_name} (buffer; would need module-level reassign)")
-            return
-        # Attempt 1: empty_like with target device — preserves layout/subclass.
+        # Allocate fresh uninitialized CUDA storage. No source-data copy.
+        new_data = torch.empty(
+            param.shape, dtype=param.dtype, device=target_device, layout=param.layout
+        )
+        new_data.zero_()  # zeros are safe for the buffer/staging slots that
+                          # never get materialized real values before our
+                          # _replace_quant_method swap routes around them.
+
+        # Path 1: in-place .data swap (preserves subclass identity and attrs).
         try:
-            new_data = torch.empty_like(item, device=target_device)
-            new_data.zero_()
-            item.data = new_data
-            materialized.append(obj_name)
+            param.data = new_data
+            materialized.append(f"{owner_module.__class__.__name__}.{attr_name}")
             return
         except RuntimeError:
             pass
-        # Attempt 2: .to(device) — preserves Parameter subclass behavior on materialization.
-        try:
-            new_data = item.to(device=target_device)
-            if new_data.device.type == "meta":  # to() refused
-                raise RuntimeError("to(device) returned meta tensor")
-            new_data.zero_()
-            item.data = new_data
-            materialized.append(f"{obj_name} (via .to())")
-            return
-        except RuntimeError as e:
-            failed.append(f"{obj_name} (rejected: {e})")
 
-    for name, param in layer.named_parameters(recurse=True):
-        _walk(f"param:{name}", param)
-    for name, buf in layer.named_buffers(recurse=True):
-        _walk(f"buffer:{name}", buf)
+        # Path 2: replace the whole Parameter via owning module's _parameters
+        # dict. Try to keep the subclass; if its __init__ won't accept
+        # (data, requires_grad=False), fall back to plain nn.Parameter.
+        new_param = None
+        try:
+            new_param = type(param)(new_data, requires_grad=False)
+        except TypeError:
+            try:
+                new_param = torch.nn.Parameter(new_data, requires_grad=False)
+            except Exception as e:
+                failed.append(f"{attr_name} (constructor: {type(e).__name__}: {e})")
+                return
+        # Preserve vLLM's loader hooks so downstream code keeps working.
+        for attr in ("weight_loader", "output_dim", "input_dim", "is_metadata"):
+            if hasattr(param, attr):
+                try:
+                    setattr(new_param, attr, getattr(param, attr))
+                except Exception:
+                    pass
+        owner_module._parameters[attr_name] = new_param
+        materialized.append(f"{owner_module.__class__.__name__}.{attr_name} (full-replace)")
+
+    # Walk every module (layer itself + sub-modules) and its direct params.
+    for _mod_name, sub in layer.named_modules():
+        for p_name in list(sub._parameters.keys()):
+            param = sub._parameters[p_name]
+            if param is not None:
+                _try_materialize(sub, p_name, param)
 
     if failed:
         logger.warning(
-            "TurboQuant native-packed MoE finalize (%s): could not materialize %d tensors: %s",
+            "TurboQuant native-packed MoE finalize (%s): could not materialize %d params: %s",
             label, len(failed), failed[:10],
         )
 
@@ -574,6 +589,13 @@ def _finalize_native_packed_moe(
     # uses these slots only as buffers/scales that the kernel rewrites or for
     # FP8 staging (which we don't quantize to, but vLLM allocates regardless).
     _materialize_meta_tensors(layer, label="post-finalize")
+
+    # The materialize sweep above replaces ANY meta param with empty zeros.
+    # If `_replace_quant_method` put w13_weight/w2_weight on meta, the sweep
+    # just clobbered our pool binding with empty zeros. Re-bind one final time
+    # so the kernel sees the live pool tensors.
+    _bind_real_weight_param("w13_weight", pool.w13)
+    _bind_real_weight_param("w2_weight", pool.w2)
 
     for name in (
         "w13_weight_tq_packed",
