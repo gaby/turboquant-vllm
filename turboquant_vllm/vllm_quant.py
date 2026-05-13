@@ -957,9 +957,7 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                     # internal tensors (stored via setattr), so a meta leak
                     # at this entry point becomes invisible until decode.
                     meta_placeholders = [
-                        n
-                        for n in _NATIVE_PACKED_PARAM_NAMES
-                        if hasattr(layer, n) and getattr(layer, n).is_meta
+                        n for n in _NATIVE_PACKED_PARAM_NAMES if hasattr(layer, n) and getattr(layer, n).is_meta
                     ]
                     if meta_placeholders:
                         raise RuntimeError(
@@ -1073,6 +1071,8 @@ def _try_pre_fused_rename(base: str) -> str | None:
     if target is None:
         return None
     return f"{m.group(1)}.{target}"
+
+
 _NATIVE_MOE_PROJ_FUSION = {
     "gate_proj": "w13_weight",
     "up_proj": "w13_weight",
@@ -1268,8 +1268,7 @@ def _maybe_flush_native_moe_target(
             _flush_debug_count["no_target"] += 1
             sample_experts_keys = [k for k in meta_params if ".experts." in k][:5]
             logger.warning(
-                "regroup miss [no_target]: looking for %r, not in meta_params. "
-                "Sample meta_params .experts. keys: %s",
+                "regroup miss [no_target]: looking for %r, not in meta_params. Sample meta_params .experts. keys: %s",
                 target_key,
                 sample_experts_keys,
             )
@@ -1399,8 +1398,7 @@ def _patch_weight_name_remapping():
         if native_packed:
             experts_meta_keys = [k for k in moe_meta_params if ".experts." in k]
             logger.info(
-                "TQ3 native regroup setup: mapper=%s, meta_params has %d keys total, "
-                "%d with .experts. (sample: %s)",
+                "TQ3 native regroup setup: mapper=%s, meta_params has %d keys total, %d with .experts. (sample: %s)",
                 "yes" if mapper is not None else "no",
                 len(moe_meta_params),
                 len(experts_meta_keys),
@@ -1503,8 +1501,7 @@ def _patch_weight_name_remapping():
             )
         if native_packed:
             logger.info(
-                "TQ3 native MoE regroup: saw %d per-expert tensors from disk, "
-                "yielded %d fused MoE targets",
+                "TQ3 native MoE regroup: saw %d per-expert tensors from disk, yielded %d fused MoE targets",
                 seen_native_moe_disk,
                 yielded_native_moe,
             )
