@@ -1041,6 +1041,19 @@ _FP8_LEFTOVER_SCALE_SUFFIXES = (
 )
 
 _EXPERT_INDEX_PATTERN = re.compile(r"^(.+?)\.experts\.(\d+)\.(.+)$")
+# Qwen3.6-style native-packed checkpoints store the per-layer experts
+# pre-fused on disk: `.experts.gate_up_proj.tq_packed` (gate+up stacked
+# across all experts) and `.experts.down_proj.tq_packed`. No per-expert
+# index, no `.weight.` — direct from disk → placeholder.
+_NATIVE_MOE_PRE_FUSED_PATTERN = re.compile(
+    r"^(.+?\.experts)\.(gate_up_proj|down_proj|w13_weight|w2_weight)$"
+)
+_NATIVE_MOE_PRE_FUSED_TO_TARGET = {
+    "gate_up_proj": "w13_weight",
+    "down_proj": "w2_weight",
+    "w13_weight": "w13_weight",
+    "w2_weight": "w2_weight",
+}
 _NATIVE_MOE_PROJ_FUSION = {
     "gate_proj": "w13_weight",
     "up_proj": "w13_weight",
@@ -1380,6 +1393,20 @@ def _patch_weight_name_remapping():
                 return n
             return mapper._map_name(n)
 
+        def _try_pre_fused_rename(base: str) -> str | None:
+            # Qwen3.6+ native-packed: experts on disk are pre-fused per layer
+            # (e.g. .experts.gate_up_proj.tq_packed); yield directly to the
+            # matching placeholder name so AutoWeightsLoader routes it to
+            # w13_weight_tq_packed without going through the per-expert
+            # regroup machinery.
+            m = _NATIVE_MOE_PRE_FUSED_PATTERN.match(base)
+            if not m:
+                return None
+            target = _NATIVE_MOE_PRE_FUSED_TO_TARGET.get(m.group(2))
+            if target is None:
+                return None
+            return f"{m.group(1)}.{target}"
+
         for raw_name, tensor in _original_get_all_weights(self, model_config, model):
             name = _map(raw_name)
             if name is None:
@@ -1387,6 +1414,11 @@ def _patch_weight_name_remapping():
             if name.endswith(".tq_packed") and ".experts." in name:
                 seen_native_moe_disk += 1
                 base = name[: -len(".tq_packed")]
+                pre_fused = _try_pre_fused_rename(base)
+                if pre_fused is not None:
+                    yielded_native_moe += 1
+                    yield f"{pre_fused}_tq_packed", tensor
+                    continue
                 pending_moe_pairs.setdefault(base, {})["packed"] = tensor
                 if "norms" in pending_moe_pairs[base]:
                     ready_tensors = pending_moe_pairs.pop(base)
@@ -1403,6 +1435,11 @@ def _patch_weight_name_remapping():
             elif name.endswith(".tq_norms") and ".experts." in name:
                 seen_native_moe_disk += 1
                 base = name[: -len(".tq_norms")]
+                pre_fused = _try_pre_fused_rename(base)
+                if pre_fused is not None:
+                    yielded_native_moe += 1
+                    yield f"{pre_fused}_tq_norms", tensor
+                    continue
                 pending_moe_pairs.setdefault(base, {})["norms"] = tensor
                 if "packed" in pending_moe_pairs[base]:
                     ready_tensors = pending_moe_pairs.pop(base)
