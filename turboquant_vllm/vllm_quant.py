@@ -752,6 +752,10 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             else:
                 self._local_moe_scratch_pool = pool
 
+        @property
+        def supports_eplb(self) -> bool:
+            return bool(getattr(self._unquant, "supports_eplb", False))
+
         def create_weights(self, layer: nn.Module, **kwargs):
             self._unquant.create_weights(layer, **kwargs)
 

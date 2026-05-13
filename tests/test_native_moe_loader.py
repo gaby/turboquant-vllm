@@ -101,6 +101,18 @@ class TestMoEScratchPoolOwnership(unittest.TestCase):
         self.assertIs(method_a2._get_moe_scratch_pool(), pool)
         self.assertIsNone(method_b._get_moe_scratch_pool())
 
+    def test_online_moe_method_delegates_eplb_support(self):
+        if TurboQuantOnlineMoEMethod is None:
+            self.skipTest("TurboQuantOnlineMoEMethod unavailable")
+
+        class _FakeUnquant:
+            supports_eplb = True
+
+        method = TurboQuantOnlineMoEMethod(3, 8, object())
+        method._unquant = _FakeUnquant()
+
+        self.assertTrue(method.supports_eplb)
+
 
 class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
     """Compressed3D.from_packed must produce identical decompression
