@@ -206,6 +206,9 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # to plumb through the kernel.
         return None
 
+    def _delegate_method(self, layer: torch.nn.Module):
+        return self._base_method or layer.base_quant_method
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -231,11 +234,25 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
         self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
 
-        base_method = self._base_method or layer.base_quant_method
-        return base_method.apply(
+        return self._delegate_method(layer).apply(
             layer=layer,
             x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        pool = self._pool
+        self._w13.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
+        self._w2.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
+        return self._delegate_method(layer).apply_monolithic(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
         )

@@ -615,6 +615,55 @@ class TestNativeMoEPackedRegroup(unittest.TestCase):
         self.assertTrue(torch.equal(layer._tq_w13_weight.packed, expected_packed))
         self.assertTrue(torch.equal(layer._tq_w13_weight.norms, expected_norms))
 
+    def test_finalize_native_packed_moe_rejects_flashinfer_trtllm(self):
+        bits = 3
+        group_size = 8
+        w13 = torch.randn(2, 8, 8)
+        w2 = torch.randn(2, 4, 8)
+        layer = _FakeExperts()
+        w13_comp = Compressed3D(w13, bits=bits, group_size=group_size)
+        w2_comp = Compressed3D(w2, bits=bits, group_size=group_size)
+
+        layer.register_parameter(
+            "w13_weight_tq_packed",
+            nn.Parameter(w13_comp.packed.reshape(16, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w13_weight_tq_norms",
+            nn.Parameter(w13_comp.norms.clone(), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_packed",
+            nn.Parameter(w2_comp.packed.reshape(8, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_norms",
+            nn.Parameter(w2_comp.norms.clone(), requires_grad=False),
+        )
+
+        class _Backend:
+            name = "FLASHINFER_TRTLLM"
+
+        class _FakeUnquant:
+            unquantized_backend = _Backend()
+
+            def process_weights_after_loading(self, _layer):
+                return None
+
+        class _FakeMethod:
+            def __init__(self):
+                self.bits = bits
+                self.group_size = group_size
+                self._unquant = _FakeUnquant()
+
+        with self.assertRaisesRegex(NotImplementedError, "FlashInfer TRTLLM"):
+            _finalize_native_packed_moe(
+                layer,
+                _FakeMethod(),
+                {"w13_weight": (2, 8, 8), "w2_weight": (2, 4, 8)},
+                {"w13_weight": torch.float32, "w2_weight": torch.float32},
+            )
+
     def test_finalize_native_packed_moe_replaces_layer_quant_method(self):
         if not _HAS_FUSED_MOE:
             self.skipTest("vLLM fused MoE not available in local test environment")

@@ -617,6 +617,12 @@ def _finalize_native_packed_moe(
         bits=method.bits,
         group_size=method.group_size,
     )
+    if _backend_name() == "FLASHINFER_TRTLLM":
+        raise NotImplementedError(
+            "TurboQuant native-packed MoE does not support FlashInfer TRTLLM's "
+            "block-layout BF16 backend. Use VLLM_FLASHINFER_MOE_BACKEND=throughput "
+            "or moe_backend=flashinfer_cutlass/triton for native TQ3 checkpoints."
+        )
     if _needs_w13_w31_layout():
         w13_c = _swap_w13_to_w31_compressed(w13_c)
 
