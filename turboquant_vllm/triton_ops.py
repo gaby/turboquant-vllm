@@ -120,8 +120,20 @@ if HAS_TRITON:
 
                 ptrs0 = packed_row[:, None] * stride_packed_n + byte_idx0[None, :] * stride_packed_k
                 b0 = tl.load(packed_ptr + ptrs0, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                # b1 is only consumed when `crosses` is true (3-bit code spans
+                # two bytes). Without `& crosses[None, :]` in the mask, the load
+                # fires unconditionally — for offs_k=127 (last position in the
+                # last group_size=128 group) byte_idx1 = 48 reads one byte past
+                # the per-row packed buffer (48 bytes wide, indices 0..47).
+                # On A100/sm_80 that hits a guard page and surfaces as
+                # `Triton Error [CUDA]: an illegal memory access`. On Blackwell
+                # the same OOB lands in safe memory and was silently no-op'd.
                 ptrs1 = packed_row[:, None] * stride_packed_n + byte_idx1[None, :] * stride_packed_k
-                b1 = tl.load(packed_ptr + ptrs1, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                b1 = tl.load(
+                    packed_ptr + ptrs1,
+                    mask=(offs_n[:, None] < N) & crosses[None, :],
+                    other=0,
+                ).to(tl.int32)
 
                 single = (b0 >> bit_in_byte[None, :]) & 0x7
                 cross = ((b0 >> bit_in_byte[None, :]) | (b1 << (8 - bit_in_byte[None, :]))) & 0x7
@@ -493,8 +505,17 @@ if HAS_TRITON:
 
                 ptrs0 = packed_row[:, None] * stride_cn + byte_idx0[None, :] * stride_ck
                 b0 = tl.load(codes_ptr + ptrs0, mask=mask_n[:, None], other=0).to(tl.int32)
+                # b1 only consumed when `crosses` (bit_in_byte > 5). Without
+                # `& crosses[None, :]` in the mask the load OOBs by one byte
+                # at offs_k=127 (byte_idx1=48, row width=48). Hits A100/sm_80
+                # guard page → Triton illegal memory access. See sibling kernel
+                # at line ~120 for the full diagnosis.
                 ptrs1 = packed_row[:, None] * stride_cn + byte_idx1[None, :] * stride_ck
-                b1 = tl.load(codes_ptr + ptrs1, mask=mask_n[:, None], other=0).to(tl.int32)
+                b1 = tl.load(
+                    codes_ptr + ptrs1,
+                    mask=mask_n[:, None] & crosses[None, :],
+                    other=0,
+                ).to(tl.int32)
 
                 single = (b0 >> bit_in_byte[None, :]) & 0x7
                 cross = ((b0 >> bit_in_byte[None, :]) | (b1 << (8 - bit_in_byte[None, :]))) & 0x7

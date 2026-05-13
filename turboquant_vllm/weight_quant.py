@@ -763,6 +763,15 @@ class Compressed3D:
 
         Skips compression — the packed indices and norms are used directly.
         """
+        # Why: Compressed3D is stored via setattr (not register_buffer), so
+        # nn.Module._apply never walks its internal tensors. A meta leak here
+        # stays invisible until decompress asserts out.device == packed.device.
+        if packed.is_meta or norms.is_meta:
+            raise RuntimeError(
+                f"Compressed3D.from_packed got meta tensor "
+                f"(packed.is_meta={packed.is_meta}, norms.is_meta={norms.is_meta}); "
+                f"native MoE regroup did not populate weights."
+            )
         obj = object.__new__(cls)
         n_experts, out_dim, in_dim = shape
         obj.shape = shape
@@ -1378,7 +1387,14 @@ def _replace_linear_layers(
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.
-            new_method = TurboQuantFusedMoEMethod(module.moe_config, w13_c, w2_c, moe_scratch_pool)
+            base_method = getattr(module, "base_quant_method", getattr(module, "quant_method", None))
+            new_method = TurboQuantFusedMoEMethod(
+                module.moe_config,
+                w13_c,
+                w2_c,
+                moe_scratch_pool,
+                base_method=base_method,
+            )
             module._replace_quant_method(new_method)
             _moe_compressed_count += 1
 

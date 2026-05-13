@@ -24,11 +24,15 @@ from turboquant_vllm.weight_quant import (
     packed_group_bytes,
 )
 from turboquant_vllm.vllm_quant import (
+    TurboQuantConfig,
     TurboQuantOnlineMoEMethod,
+    _collect_residual_meta_tensors,
     _finalize_native_packed_moe,
+    _materialize_meta_tensors,
     _maybe_flush_native_moe_target,
     _regroup_native_moe_packed_tensors,
     _collect_meta_params,
+    _try_pre_fused_rename,
 )
 from turboquant_vllm.moe_quant import _HAS_FUSED_MOE
 
@@ -50,6 +54,69 @@ class TestPackedGroupBytes(unittest.TestCase):
     def test_2bit(self):
         self.assertEqual(packed_group_bytes(2, 128), 32)
         self.assertEqual(packed_group_bytes(2, 64), 16)
+
+
+class TestMetaTensorMaterialization(unittest.TestCase):
+    def test_materialize_meta_params_and_buffers_preserves_attrs_and_stride(self):
+        layer = nn.Module()
+        param = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        param.custom_marker = "keep-me"
+        layer.register_parameter("weight", param)
+
+        buf = torch.empty_strided((3, 2), (1, 3), device="meta")
+        buf.custom_marker = "keep-buffer"
+        layer.register_buffer("scratch", buf)
+
+        skipped = torch.empty(4, device="meta", dtype=torch.int32)
+        layer.register_buffer("_expert_map", skipped)
+
+        materialized = _materialize_meta_tensors(layer, label="unit-test")
+
+        self.assertIn("_parameters:Module.weight", materialized)
+        self.assertIn("_buffers:Module.scratch", materialized)
+        self.assertFalse(layer.weight.is_meta)
+        self.assertFalse(layer.scratch.is_meta)
+        self.assertEqual(layer.weight.stride(), (1, 2))
+        self.assertEqual(layer.scratch.stride(), (1, 3))
+        self.assertEqual(layer.weight.custom_marker, "keep-me")
+        self.assertEqual(layer.scratch.custom_marker, "keep-buffer")
+        self.assertTrue(layer._expert_map.is_meta)
+
+        residual = _collect_residual_meta_tensors(layer, "layer")
+        self.assertEqual(residual, [])
+
+
+class TestMoEScratchPoolOwnership(unittest.TestCase):
+    def test_scratch_pool_is_shared_by_config_not_module_global(self):
+        if TurboQuantOnlineMoEMethod is None or TurboQuantConfig is None:
+            self.skipTest("TurboQuant vLLM config unavailable")
+
+        owner_a = TurboQuantConfig(bits=3, group_size=8)
+        owner_b = TurboQuantConfig(bits=3, group_size=8)
+        method_a1 = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_a)
+        method_a2 = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_a)
+        method_b = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_b)
+
+        pool = object()
+        method_a1._set_moe_scratch_pool(pool)
+
+        self.assertIs(method_a2._get_moe_scratch_pool(), pool)
+        self.assertIsNone(method_b._get_moe_scratch_pool())
+
+    def test_online_moe_method_delegates_eplb_support(self):
+        if TurboQuantOnlineMoEMethod is None:
+            self.skipTest("TurboQuantOnlineMoEMethod unavailable")
+
+        class _FakeUnquant:
+            supports_eplb = True
+
+        method = TurboQuantOnlineMoEMethod(3, 8, object())
+        method._unquant = _FakeUnquant()
+
+        self.assertTrue(method.supports_eplb)
 
 
 class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
@@ -322,6 +389,41 @@ class TestNativeMoEPackedRegroup(unittest.TestCase):
         self.assertLess((w13_comp.decompress() - expected_w13).abs().max().item(), 2.0)
         self.assertLess((w2_comp.decompress() - expected_w2).abs().max().item(), 2.0)
 
+    def test_pre_fused_rename_handles_qwen36_layout(self):
+        """Qwen3.6 native checkpoints store experts pre-fused per layer:
+        `.experts.gate_up_proj.tq_packed` (no per-expert index), with or
+        without `.weight` suffix, and bare `w13`/`w2` aliases."""
+        prefix = "language_model.model.layers.5.mlp.experts"
+        cases = [
+            (f"{prefix}.gate_up_proj", f"{prefix}.w13_weight"),
+            (f"{prefix}.gate_up_proj.weight", f"{prefix}.w13_weight"),
+            (f"{prefix}.down_proj", f"{prefix}.w2_weight"),
+            (f"{prefix}.down_proj.weight", f"{prefix}.w2_weight"),
+            (f"{prefix}.w13", f"{prefix}.w13_weight"),
+            (f"{prefix}.w2", f"{prefix}.w2_weight"),
+            (f"{prefix}.w13_weight", f"{prefix}.w13_weight"),
+            (f"{prefix}.w2_weight", f"{prefix}.w2_weight"),
+        ]
+        for base, expected in cases:
+            self.assertEqual(_try_pre_fused_rename(base), expected, f"input={base!r}")
+
+    def test_pre_fused_rename_returns_none_for_per_expert_layout(self):
+        """Per-expert names (Qwen3-30B-A3B layout) must NOT match the
+        pre-fused dispatch so the existing regroup path handles them."""
+        per_expert_names = [
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.42.up_proj.weight",
+            "model.layers.0.mlp.experts.7.down_proj.weight",
+            "model.layers.0.mlp.experts.3.w1.weight",
+            # Unknown projections inside the .experts.<idx>. namespace
+            "model.layers.0.mlp.experts.0.unknown_proj.weight",
+            # Module names that look similar but aren't expert blocks
+            "model.layers.0.gate_up_proj.weight",
+            "language_model.lm_head.weight",
+        ]
+        for name in per_expert_names:
+            self.assertIsNone(_try_pre_fused_rename(name), f"input={name!r}")
+
     def test_incremental_native_moe_flush_emits_when_target_complete(self):
         model = _FakeRoot()
         bits = 3
@@ -488,6 +590,119 @@ class TestNativeMoEPackedRegroup(unittest.TestCase):
 
         self.assertFalse(layer.w13_weight.is_meta)
         self.assertFalse(layer.w2_weight.is_meta)
+
+    def test_finalize_native_packed_moe_swaps_w13_for_flashinfer_cutlass(self):
+        bits = 3
+        group_size = 8
+        w13 = torch.randn(2, 8, 8)
+        w2 = torch.randn(2, 4, 8)
+
+        class _MoeConfig:
+            is_act_and_mul = True
+
+        class _FinalizeLayer(_FakeExperts):
+            def __init__(self):
+                super().__init__()
+                self.moe_config = _MoeConfig()
+
+        layer = _FinalizeLayer()
+        w13_comp = Compressed3D(w13, bits=bits, group_size=group_size)
+        w2_comp = Compressed3D(w2, bits=bits, group_size=group_size)
+
+        layer.register_parameter(
+            "w13_weight_tq_packed",
+            nn.Parameter(w13_comp.packed.reshape(16, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w13_weight_tq_norms",
+            nn.Parameter(w13_comp.norms.clone(), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_packed",
+            nn.Parameter(w2_comp.packed.reshape(8, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_norms",
+            nn.Parameter(w2_comp.norms.clone(), requires_grad=False),
+        )
+
+        class _Backend:
+            name = "FLASHINFER_CUTLASS"
+
+        class _FakeUnquant:
+            unquantized_backend = _Backend()
+
+            def process_weights_after_loading(self, _layer):
+                return None
+
+        class _FakeMethod:
+            def __init__(self):
+                self.bits = bits
+                self.group_size = group_size
+                self._unquant = _FakeUnquant()
+
+        _finalize_native_packed_moe(
+            layer,
+            _FakeMethod(),
+            {"w13_weight": (2, 8, 8), "w2_weight": (2, 4, 8)},
+            {"w13_weight": torch.float32, "w2_weight": torch.float32},
+        )
+
+        packed = w13_comp.packed.reshape(2, 8, w13_comp.n_groups, -1)
+        norms = w13_comp.norms.reshape(2, 8, w13_comp.n_groups)
+        expected_packed = torch.cat((packed[:, 4:], packed[:, :4]), dim=1).reshape_as(layer._tq_w13_weight.packed)
+        expected_norms = torch.cat((norms[:, 4:], norms[:, :4]), dim=1).reshape_as(layer._tq_w13_weight.norms)
+        self.assertTrue(torch.equal(layer._tq_w13_weight.packed, expected_packed))
+        self.assertTrue(torch.equal(layer._tq_w13_weight.norms, expected_norms))
+
+    def test_finalize_native_packed_moe_rejects_flashinfer_trtllm(self):
+        bits = 3
+        group_size = 8
+        w13 = torch.randn(2, 8, 8)
+        w2 = torch.randn(2, 4, 8)
+        layer = _FakeExperts()
+        w13_comp = Compressed3D(w13, bits=bits, group_size=group_size)
+        w2_comp = Compressed3D(w2, bits=bits, group_size=group_size)
+
+        layer.register_parameter(
+            "w13_weight_tq_packed",
+            nn.Parameter(w13_comp.packed.reshape(16, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w13_weight_tq_norms",
+            nn.Parameter(w13_comp.norms.clone(), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_packed",
+            nn.Parameter(w2_comp.packed.reshape(8, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_norms",
+            nn.Parameter(w2_comp.norms.clone(), requires_grad=False),
+        )
+
+        class _Backend:
+            name = "FLASHINFER_TRTLLM"
+
+        class _FakeUnquant:
+            unquantized_backend = _Backend()
+
+            def process_weights_after_loading(self, _layer):
+                return None
+
+        class _FakeMethod:
+            def __init__(self):
+                self.bits = bits
+                self.group_size = group_size
+                self._unquant = _FakeUnquant()
+
+        with self.assertRaisesRegex(NotImplementedError, "FlashInfer TRTLLM"):
+            _finalize_native_packed_moe(
+                layer,
+                _FakeMethod(),
+                {"w13_weight": (2, 8, 8), "w2_weight": (2, 4, 8)},
+                {"w13_weight": torch.float32, "w2_weight": torch.float32},
+            )
 
     def test_finalize_native_packed_moe_replaces_layer_quant_method(self):
         if not _HAS_FUSED_MOE:

@@ -31,8 +31,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Layers to keep at full precision
-_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
+# Layers to keep at full precision. Kept in sync with weight_quant._SKIP_PATTERNS.
+# `conv1d` is critical for Qwen3-Next / Qwen3.5 / Qwen3.6-A3B family (GatedDeltaNet /
+# linear-attention conv blocks): quantizing those weights silently corrupts outputs.
+# PR #31 added conv1d to weight_quant.py's runtime version; this file was missed,
+# letting save_tq3_checkpoint still quantize conv1d into native packed checkpoints.
+_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head", "conv1d")
 
 
 def _resolve_module(root, dotted_path: str):
@@ -126,6 +130,36 @@ def save_tq3_checkpoint(
             copied_json += 1
             logger.info("Copied local config JSON: %s", filename)
         logger.info("Copied %d additional local JSON config file(s)", copied_json)
+    else:
+        # For HF-Hub sources, AutoConfig + AutoTokenizer.save_pretrained miss
+        # multimodal / processor sibling configs (preprocessor_config.json etc.).
+        # Without these, vLLM fails to load the resulting TQ3 checkpoint when
+        # the base model is multimodal — e.g. Qwen3.6-35B-A3B fails with
+        # OSError: Can't load image processor for ... missing preprocessor_config.json.
+        from huggingface_hub import hf_hub_download
+
+        sibling_configs = (
+            "preprocessor_config.json",
+            "image_processor_config.json",
+            "processor_config.json",
+            "chat_template.json",
+            "chat_template.jinja",
+            "video_processor_config.json",
+            "generation_config.json",
+        )
+        downloaded = 0
+        for fname in sibling_configs:
+            try:
+                src = hf_hub_download(repo_id=model_id, filename=fname)
+            except Exception:
+                continue  # file not present in this repo
+            dst = os.path.join(output_dir, fname)
+            if os.path.exists(dst):
+                continue
+            shutil.copy2(src, dst)
+            downloaded += 1
+            logger.info("Copied sibling config from HF Hub: %s", fname)
+        logger.info("Copied %d sibling config file(s) from HF Hub", downloaded)
 
     if is_local:
         shard_files = sorted(f for f in os.listdir(model_id) if f.endswith(".safetensors"))

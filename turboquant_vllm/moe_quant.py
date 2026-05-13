@@ -55,10 +55,24 @@ class TurboQuantFusedMoEScratchPool:
     __slots__ = ("w13", "w2", "w13_fp32", "w2_fp32", "shape_w13", "shape_w2")
 
     def __init__(self, w13_compressed, w2_compressed):
-        device = w13_compressed.packed.device
         bf16_dtype = w13_compressed.dtype
-        self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=device)
+        # Force a real device. Inheriting `w13_compressed.packed.device`
+        # silently lands pool buffers on meta when _finalize_native_packed_moe
+        # runs while vLLM's meta-init context is still active for the layer.
+        # If the pool is on meta, every subsequent `_bind_real_weight_param`
+        # is a no-op (bind target is itself meta), and the residual-meta
+        # diagnostic surfaces (256, 1024, 2048) w13/w2 leaks per MoE layer.
+        if torch.cuda.is_available():
+            target = torch.device("cuda")
+        else:
+            src = w13_compressed.packed.device
+            target = torch.device("cpu") if src.type == "meta" else src
+        self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=target)
+        self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=target)
+        # Loud failure if a future change re-introduces the meta leak — better
+        # to fail at pool construction than at the 60th residual-meta warning.
+        assert not self.w13.is_meta, "scratch pool w13 on meta despite explicit device"
+        assert not self.w2.is_meta, "scratch pool w2 on meta despite explicit device"
         # The CUDA sparse expert dequant path writes directly into the
         # destination dtype and ignores fp32 scratch. Keep these as
         # lazy/optional placeholders so we don't reserve another full
@@ -131,6 +145,18 @@ def _collect_meta_tensors(obj, prefix: str, depth: int = 0, max_depth: int = 2) 
     return hits
 
 
+def _active_local_experts(layer: torch.nn.Module, topk_ids: torch.Tensor) -> torch.Tensor:
+    active_experts = topk_ids.flatten()
+    expert_map = getattr(layer, "_expert_map", None)
+    if expert_map is None:
+        return active_experts
+
+    valid = (active_experts >= 0) & (active_experts < expert_map.numel())
+    safe_ids = torch.where(valid, active_experts, torch.zeros_like(active_experts))
+    mapped = expert_map[safe_ids.to(torch.long)]
+    return torch.where(valid, mapped, torch.full_like(mapped, -1))
+
+
 @_register_custom_op
 class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """FusedMoE quant method that dequantizes TQ3-packed experts inside apply().
@@ -153,6 +179,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_compressed,
         w2_compressed,
         scratch_pool: TurboQuantFusedMoEScratchPool,
+        base_method=None,
     ):
         if not _HAS_FUSED_MOE:
             raise RuntimeError(
@@ -166,6 +193,15 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self._w13 = w13_compressed
         self._w2 = w2_compressed
         self._pool = scratch_pool
+        self._base_method = base_method
+        if base_method is not None:
+            self.moe_kernel = getattr(base_method, "moe_kernel", None)
+            self.moe_quant_config = getattr(base_method, "moe_quant_config", None)
+
+    @property
+    def supports_eplb(self) -> bool:
+        base_method = self._base_method
+        return bool(getattr(base_method, "supports_eplb", False))
 
     # ------------------------------------------------------------------
     # Abstract methods from FusedMoEMethodBase
@@ -196,6 +232,9 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # to plumb through the kernel.
         return None
 
+    def _delegate_method(self, layer: torch.nn.Module):
+        return self._base_method or layer.base_quant_method
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -215,16 +254,31 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # int32-per-row-unique from top-k routing, so cross-row duplicates
         # at bs>1 just cause idempotent rewrites.
         pool = self._pool
-        active_experts = topk_ids.flatten()
+        active_experts = _active_local_experts(layer, topk_ids)
         if active_experts.dtype != torch.int32:
             active_experts = active_experts.to(torch.int32)
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
         self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
 
-        return layer.base_quant_method.apply(
+        return self._delegate_method(layer).apply(
             layer=layer,
             x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        pool = self._pool
+        self._w13.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
+        self._w2.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
+        return self._delegate_method(layer).apply_monolithic(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
         )

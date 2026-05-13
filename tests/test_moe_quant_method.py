@@ -32,6 +32,7 @@ from turboquant_vllm.weight_quant import (
     TurboQuantWrapper,
     _replace_linear_layers,
 )
+from turboquant_vllm.moe_quant import _active_local_experts
 
 
 class _FakeMoeConfig:
@@ -66,6 +67,11 @@ class _FakeFusedMoE(nn.Module):
         # Match vLLM FusedMoE's public surface just enough for the walker's
         # debug-logging path to do type(self.quant_method).__name__.
         self.quant_method = types.SimpleNamespace()
+        self.base_quant_method = types.SimpleNamespace(
+            moe_kernel=object(),
+            moe_quant_config=object(),
+            supports_eplb=True,
+        )
 
     def _replace_quant_method(self, method):
         self.installed_method = method
@@ -78,11 +84,14 @@ class _FakeTurboQuantFusedMoEMethod:
     base class requirement. The walker only calls __init__ and passes the
     instance to _replace_quant_method, so this is sufficient."""
 
-    def __init__(self, moe_config, w13_compressed, w2_compressed, scratch_pool):
+    def __init__(self, moe_config, w13_compressed, w2_compressed, scratch_pool, base_method=None):
         self.moe = moe_config
         self.w13_compressed = w13_compressed
         self.w2_compressed = w2_compressed
         self.scratch_pool = scratch_pool
+        self.base_method = base_method
+        self.moe_kernel = getattr(base_method, "moe_kernel", None)
+        self.moe_quant_config = getattr(base_method, "moe_quant_config", None)
 
 
 class _FakeScratchPool:
@@ -260,6 +269,25 @@ class TestCompressed3DDecompressInto(unittest.TestCase):
         self.assertTrue(torch.equal(out[2], full[2]))
 
 
+class TestActiveLocalExperts(unittest.TestCase):
+    def test_maps_global_topk_ids_through_expert_map(self):
+        layer = nn.Module()
+        layer.register_buffer(
+            "_expert_map",
+            torch.tensor([-1, 0, -1, 1, 2], dtype=torch.int32),
+        )
+        topk_ids = torch.tensor([[3, 0], [4, 99], [-1, 2]], dtype=torch.int64)
+
+        active = _active_local_experts(layer, topk_ids)
+
+        self.assertTrue(
+            torch.equal(
+                active,
+                torch.tensor([1, -1, 2, -1, -1, -1], dtype=torch.int32),
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # enable_weight_quantization → FusedMoE walker
 # ---------------------------------------------------------------------------
@@ -294,6 +322,8 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
                 f"block_{i}: _replace_quant_method was never called",
             )
             self.assertIsInstance(expert.installed_method, _FakeTurboQuantFusedMoEMethod)
+            self.assertIs(expert.installed_method.base_method, expert.base_quant_method)
+            self.assertIs(expert.installed_method.moe_kernel, expert.base_quant_method.moe_kernel)
 
     def test_walker_attaches_compressed_tensors(self):
         model = self._build_model(n_layers=2)
