@@ -953,6 +953,30 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
         def process_weights_after_loading(self, layer: nn.Module) -> None:
             if self.native_packed:
                 if not hasattr(layer, "_tq_w13_weight"):
+                    # Defensive: if the native-packed regroup silently dropped
+                    # the per-expert tensors (e.g. hf_to_vllm_mapper mismatch),
+                    # the four placeholder params are still meta. Finalizing
+                    # would wrap meta data in Compressed3D and assert at
+                    # decode time. Catch it here with a specific error.
+                    meta_placeholders = [
+                        n
+                        for n in (
+                            "w13_weight_tq_packed",
+                            "w13_weight_tq_norms",
+                            "w2_weight_tq_packed",
+                            "w2_weight_tq_norms",
+                        )
+                        if hasattr(layer, n) and getattr(layer, n).is_meta
+                    ]
+                    if meta_placeholders:
+                        raise RuntimeError(
+                            "TQ3 native packed MoE placeholders are still on "
+                            f"meta after weight loading: {meta_placeholders}. "
+                            "The DefaultModelLoader regroup never populated "
+                            "them — finalize would store meta tensors in "
+                            "Compressed3D and assert at decode time. Check "
+                            "name-mapping in _decompress_get_all_weights."
+                        )
                     _finalize_native_packed_moe(
                         layer,
                         self,
@@ -1312,10 +1336,29 @@ def _patch_weight_name_remapping():
         moe_target_state: dict[str, dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]] = {}
         decompressed = 0
         yielded_native_moe = 0
+        seen_native_moe_disk = 0  # how many .experts.*.tq_{packed,norms} we read from disk
         skipped_fp8_scales = 0
 
-        for name, tensor in _original_get_all_weights(self, model_config, model):
+        # Multimodal models (Qwen3-VL-MoE etc.) rewrite HF names via
+        # model.hf_to_vllm_mapper before AutoWeightsLoader matches them
+        # against model.named_parameters(). _collect_meta_params keys by the
+        # post-mapper names; the native regroup must do the same lookup, so
+        # apply the mapper here before computing base / looking up targets.
+        # Vanilla MoE models (Qwen3-30B-A3B etc.) have no mapper — fall back
+        # to identity. None return means "ignore this weight".
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+
+        def _map(n: str) -> str | None:
+            if mapper is None:
+                return n
+            return mapper._map_name(n)
+
+        for raw_name, tensor in _original_get_all_weights(self, model_config, model):
+            name = _map(raw_name)
+            if name is None:
+                continue  # mapper drops this weight
             if name.endswith(".tq_packed") and ".experts." in name:
+                seen_native_moe_disk += 1
                 base = name[: -len(".tq_packed")]
                 pending_moe_pairs.setdefault(base, {})["packed"] = tensor
                 if "norms" in pending_moe_pairs[base]:
@@ -1331,6 +1374,7 @@ def _patch_weight_name_remapping():
                         yield out_name, out_tensor
                 continue
             elif name.endswith(".tq_norms") and ".experts." in name:
+                seen_native_moe_disk += 1
                 base = name[: -len(".tq_norms")]
                 pending_moe_pairs.setdefault(base, {})["norms"] = tensor
                 if "packed" in pending_moe_pairs[base]:
@@ -1388,6 +1432,28 @@ def _patch_weight_name_remapping():
                 "TQ3 native: dropped %d FP8 leftover scale tensors",
                 skipped_fp8_scales,
             )
+        if native_packed:
+            logger.info(
+                "TQ3 native MoE regroup: saw %d per-expert tensors from disk, "
+                "yielded %d fused MoE targets",
+                seen_native_moe_disk,
+                yielded_native_moe,
+            )
+            # If the checkpoint contained per-expert packed tensors but the
+            # regroup yielded zero fused targets, the name-matching path
+            # silently dropped them — most likely the model's
+            # hf_to_vllm_mapper changed prefixes and our meta_params lookup
+            # missed. Fail loud rather than fall through to a finalize that
+            # would wrap meta tensors and assert at decode time.
+            if seen_native_moe_disk > 0 and yielded_native_moe == 0:
+                raise RuntimeError(
+                    f"TQ3 native MoE regroup matched zero fused targets despite "
+                    f"reading {seen_native_moe_disk} per-expert .tq_{{packed,norms}} "
+                    f"tensors from disk. Likely cause: model.hf_to_vllm_mapper "
+                    f"rewrote parameter names but _collect_meta_params keys vs. "
+                    f"_maybe_flush_native_moe_target lookup are out of sync. "
+                    f"Check the model class for an unusual mapper or report this."
+                )
 
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
