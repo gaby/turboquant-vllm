@@ -1178,6 +1178,10 @@ def _regroup_native_moe_packed_tensors(
     return direct_targets
 
 
+_FLUSH_DEBUG_LIMIT = 5
+_flush_debug_count = {"no_regex": 0, "unknown_proj": 0, "no_target": 0, "wrong_shape": 0}
+
+
 def _maybe_flush_native_moe_target(
     model,
     base_name: str,
@@ -1204,6 +1208,9 @@ def _maybe_flush_native_moe_target(
 
     match = _EXPERT_INDEX_PATTERN.match(base_name)
     if not match:
+        if _flush_debug_count["no_regex"] < _FLUSH_DEBUG_LIMIT:
+            _flush_debug_count["no_regex"] += 1
+            logger.warning("regroup miss [no_regex]: base_name=%r", base_name)
         return []
 
     container_path = match.group(1) + ".experts"
@@ -1212,15 +1219,39 @@ def _maybe_flush_native_moe_target(
     proj_name = proj_suffix.split(".")[0]
     target_name = _NATIVE_MOE_PROJ_FUSION.get(proj_name)
     if target_name is None:
+        if _flush_debug_count["unknown_proj"] < _FLUSH_DEBUG_LIMIT:
+            _flush_debug_count["unknown_proj"] += 1
+            logger.warning(
+                "regroup miss [unknown_proj]: proj_name=%r base_name=%r (known: %s)",
+                proj_name,
+                base_name,
+                list(_NATIVE_MOE_PROJ_FUSION.keys()),
+            )
         return []
 
     target_key = f"{container_path}.{target_name}"
     meta_entry = meta_params.get(target_key)
     if meta_entry is None:
+        if _flush_debug_count["no_target"] < _FLUSH_DEBUG_LIMIT:
+            _flush_debug_count["no_target"] += 1
+            sample_experts_keys = [k for k in meta_params if ".experts." in k][:5]
+            logger.warning(
+                "regroup miss [no_target]: looking for %r, not in meta_params. "
+                "Sample meta_params .experts. keys: %s",
+                target_key,
+                sample_experts_keys,
+            )
         return []
 
     _, _, meta_param = meta_entry
     if len(meta_param.shape) != 3:
+        if _flush_debug_count["wrong_shape"] < _FLUSH_DEBUG_LIMIT:
+            _flush_debug_count["wrong_shape"] += 1
+            logger.warning(
+                "regroup miss [wrong_shape]: target=%r expected 3D, got shape=%s",
+                target_key,
+                tuple(meta_param.shape),
+            )
         return []
 
     order = _NATIVE_MOE_PROJ_ORDER[proj_name]
@@ -1333,6 +1364,16 @@ def _patch_weight_name_remapping():
         # this step, multimodal MoE (Qwen3-VL) silently drops every
         # per-expert tensor because the regroup target lookup never matches.
         mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if native_packed:
+            experts_meta_keys = [k for k in moe_meta_params if ".experts." in k]
+            logger.info(
+                "TQ3 native regroup setup: mapper=%s, meta_params has %d keys total, "
+                "%d with .experts. (sample: %s)",
+                "yes" if mapper is not None else "no",
+                len(moe_meta_params),
+                len(experts_meta_keys),
+                experts_meta_keys[:5],
+            )
 
         def _map(n: str) -> str | None:
             if mapper is None:
