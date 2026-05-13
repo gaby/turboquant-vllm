@@ -520,15 +520,19 @@ def _collect_residual_meta_tensors(obj, prefix: str, max_depth: int = 4) -> list
             return
         if isinstance(value, torch.nn.Module):
             for name, param in value._parameters.items():
+                if name in _META_MATERIALIZE_SKIP_TENSORS:
+                    continue
                 _walk(param, f"{path}._parameters.{name}", depth + 1)
             for name, buf in value._buffers.items():
+                if name in _META_MATERIALIZE_SKIP_TENSORS:
+                    continue
                 _walk(buf, f"{path}._buffers.{name}", depth + 1)
             for name, sub in value._modules.items():
                 _walk(sub, f"{path}.{name}", depth + 1)
             return
         if hasattr(value, "__dict__"):
             for name, item in vars(value).items():
-                if name.startswith("__"):
+                if name.startswith("__") or name in _META_MATERIALIZE_SKIP_TENSORS:
                     continue
                 _walk(item, f"{path}.{name}", depth + 1)
 

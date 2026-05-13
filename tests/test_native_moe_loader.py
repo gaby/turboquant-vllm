@@ -26,6 +26,7 @@ from turboquant_vllm.weight_quant import (
 from turboquant_vllm.vllm_quant import (
     TurboQuantConfig,
     TurboQuantOnlineMoEMethod,
+    _collect_residual_meta_tensors,
     _finalize_native_packed_moe,
     _materialize_meta_tensors,
     _maybe_flush_native_moe_target,
@@ -82,6 +83,9 @@ class TestMetaTensorMaterialization(unittest.TestCase):
         self.assertEqual(layer.weight.custom_marker, "keep-me")
         self.assertEqual(layer.scratch.custom_marker, "keep-buffer")
         self.assertTrue(layer._expert_map.is_meta)
+
+        residual = _collect_residual_meta_tensors(layer, "layer")
+        self.assertEqual(residual, [])
 
 
 class TestMoEScratchPoolOwnership(unittest.TestCase):
