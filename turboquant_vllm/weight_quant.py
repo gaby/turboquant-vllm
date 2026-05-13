@@ -763,20 +763,14 @@ class Compressed3D:
 
         Skips compression — the packed indices and norms are used directly.
         """
-        # Compressed3D is stored on the layer via setattr (not register_buffer),
-        # so nn.Module._apply does not walk its internal tensors. If we accept
-        # meta tensors here, no later sweep can fix them, and decompress at
-        # decode time will assert with `out.device == self.packed.device`.
-        # Catch the leak at construction with a specific error message.
+        # Why: Compressed3D is stored via setattr (not register_buffer), so
+        # nn.Module._apply never walks its internal tensors. A meta leak here
+        # stays invisible until decompress asserts out.device == packed.device.
         if packed.is_meta or norms.is_meta:
             raise RuntimeError(
-                f"Compressed3D.from_packed received meta tensor(s): "
-                f"packed.is_meta={packed.is_meta} norms.is_meta={norms.is_meta}. "
-                f"This means the native-packed TQ3 weights were never populated "
-                f"from disk before _finalize_native_packed_moe ran. Check the "
-                f"native MoE regroup path in vllm_quant.py — most likely the "
-                f"model's hf_to_vllm_mapper renamed parameters and the regroup "
-                f"silently dropped its targets."
+                f"Compressed3D.from_packed got meta tensor "
+                f"(packed.is_meta={packed.is_meta}, norms.is_meta={norms.is_meta}); "
+                f"native MoE regroup did not populate weights."
             )
         obj = object.__new__(cls)
         n_experts, out_dim, in_dim = shape
