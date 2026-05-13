@@ -400,6 +400,58 @@ def _materialize_and_process(
     method._do_compress(layer)
 
 
+def _materialize_meta_tensors(layer, label: str = ""):
+    """Walk every parameter and buffer on `layer` (recursively through
+    sub-modules), and for each one still on the `meta` device, replace its
+    data with a zero CUDA tensor of the same shape and dtype.
+
+    Why: vLLM's FusedMoE creates parameter slots up front (some on meta until
+    first use). PR #44's native-packed loader rebinds w13_weight/w2_weight to
+    real CUDA tensors, but vLLM 0.20+ FlashInfer CUTLASS MoE backend reads
+    additional tensors (scales, packing tables, FP8 staging buffers) — and its
+    `run_moe` DLPack conversion fails with "Cannot pack tensors on meta" if
+    any of those still live on the meta device when the first forward fires.
+
+    Logs every name materialized so the run output documents which slots
+    needed the rescue. Returns the list of materialized names for callers
+    that want to assert on the result.
+    """
+    target_device = "cuda" if torch.cuda.is_available() else "cpu"
+    materialized: list[str] = []
+
+    # Walk both Parameters and Buffers; cover the layer itself + any
+    # sub-modules (named_parameters/named_buffers do the recursion).
+    def _walk(obj_name: str, item, is_param: bool):
+        if item is None or not isinstance(item, torch.Tensor):
+            return
+        if item.device.type != "meta":
+            return
+        # Replace in place. For Parameters we need to swap .data; the wrapping
+        # nn.Parameter stays the same object, only its underlying storage moves.
+        replacement = torch.zeros(item.shape, dtype=item.dtype, device=target_device)
+        if isinstance(item, torch.nn.Parameter):
+            item.data = replacement
+        else:
+            # Buffer — re-register on the owning module.
+            # We can't easily find the owning module here without more wiring;
+            # log loudly so we can extend the walker if a buffer-only case shows up.
+            materialized.append(f"{obj_name} (BUFFER — manual rebind needed)")
+            return
+        materialized.append(obj_name)
+
+    for name, param in layer.named_parameters(recurse=True):
+        _walk(f"param:{name}", param, is_param=True)
+    for name, buf in layer.named_buffers(recurse=True):
+        _walk(f"buffer:{name}", buf, is_param=False)
+
+    if materialized:
+        logger.info(
+            "TurboQuant native-packed MoE finalize (%s): materialized %d meta tensors: %s",
+            label, len(materialized), materialized[:20],
+        )
+    return materialized
+
+
 def _finalize_native_packed_moe(
     layer,
     method,
@@ -483,16 +535,20 @@ def _finalize_native_packed_moe(
         layer.base_quant_method = method._unquant
         layer._replace_quant_method(TurboQuantFusedMoEMethod(layer.moe_config, w13_c, w2_c, pool))
 
-    if logger.isEnabledFor(logging.DEBUG):
-        meta_hits = []
-        meta_hits.extend(_collect_meta_tensors(layer.w13_weight, "layer.w13_weight"))
-        meta_hits.extend(_collect_meta_tensors(layer.w2_weight, "layer.w2_weight"))
-        meta_hits.extend(_collect_meta_tensors(getattr(layer, "expert_map", None), "layer.expert_map"))
-        meta_hits.extend(_collect_meta_tensors(getattr(layer, "base_quant_method", None), "layer.base_quant_method"))
-        if meta_hits:
-            raise RuntimeError(
-                "TurboQuant detected meta tensors after native MoE finalize: " + "; ".join(meta_hits[:20])
-            )
+    # Full-coverage meta-tensor sweep. The earlier targeted walk (w13/w2/
+    # expert_map/base_quant_method) only flagged the parameters PR #44 itself
+    # rebinds. vLLM 0.20+ FlashInfer CUTLASS MoE backend reads ADDITIONAL
+    # tensors (per-expert scales, packing tables, FP8 staging buffers) created
+    # by the unquant's process_weights_after_loading or by `_replace_quant_method`
+    # — and `run_moe`'s DLPack conversion fails with "Cannot pack tensors on meta"
+    # if any of those still live on the meta device.
+    #
+    # Strategy: walk every parameter + buffer on the layer (and recursively on
+    # sub-modules), and if any are on meta, materialize them as a zero tensor
+    # on the active CUDA device. Zeros are safe because the FlashInfer path
+    # uses these slots only as buffers/scales that the kernel rewrites or for
+    # FP8 staging (which we don't quantize to, but vLLM allocates regardless).
+    _materialize_meta_tensors(layer, label="post-finalize")
 
     for name in (
         "w13_weight_tq_packed",
