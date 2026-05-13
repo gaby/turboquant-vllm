@@ -32,6 +32,7 @@ from turboquant_vllm.weight_quant import (
     TurboQuantWrapper,
     _replace_linear_layers,
 )
+from turboquant_vllm.moe_quant import _active_local_experts
 
 
 class _FakeMoeConfig:
@@ -266,6 +267,25 @@ class TestCompressed3DDecompressInto(unittest.TestCase):
         # the valid slots match.
         self.assertTrue(torch.equal(out[0], full[0]))
         self.assertTrue(torch.equal(out[2], full[2]))
+
+
+class TestActiveLocalExperts(unittest.TestCase):
+    def test_maps_global_topk_ids_through_expert_map(self):
+        layer = nn.Module()
+        layer.register_buffer(
+            "_expert_map",
+            torch.tensor([-1, 0, -1, 1, 2], dtype=torch.int32),
+        )
+        topk_ids = torch.tensor([[3, 0], [4, 99], [-1, 2]], dtype=torch.int64)
+
+        active = _active_local_experts(layer, topk_ids)
+
+        self.assertTrue(
+            torch.equal(
+                active,
+                torch.tensor([1, -1, 2, -1, -1, -1], dtype=torch.int32),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

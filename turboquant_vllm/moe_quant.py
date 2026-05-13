@@ -131,6 +131,18 @@ def _collect_meta_tensors(obj, prefix: str, depth: int = 0, max_depth: int = 2) 
     return hits
 
 
+def _active_local_experts(layer: torch.nn.Module, topk_ids: torch.Tensor) -> torch.Tensor:
+    active_experts = topk_ids.flatten()
+    expert_map = getattr(layer, "_expert_map", None)
+    if expert_map is None:
+        return active_experts
+
+    valid = (active_experts >= 0) & (active_experts < expert_map.numel())
+    safe_ids = torch.where(valid, active_experts, torch.zeros_like(active_experts))
+    mapped = expert_map[safe_ids.to(torch.long)]
+    return torch.where(valid, mapped, torch.full_like(mapped, -1))
+
+
 @_register_custom_op
 class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """FusedMoE quant method that dequantizes TQ3-packed experts inside apply().
@@ -228,7 +240,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # int32-per-row-unique from top-k routing, so cross-row duplicates
         # at bs>1 just cause idempotent rewrites.
         pool = self._pool
-        active_experts = topk_ids.flatten()
+        active_experts = _active_local_experts(layer, topk_ids)
         if active_experts.dtype != torch.int32:
             active_experts = active_experts.to(torch.int32)
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
