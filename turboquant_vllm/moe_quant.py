@@ -55,10 +55,24 @@ class TurboQuantFusedMoEScratchPool:
     __slots__ = ("w13", "w2", "w13_fp32", "w2_fp32", "shape_w13", "shape_w2")
 
     def __init__(self, w13_compressed, w2_compressed):
-        device = w13_compressed.packed.device
         bf16_dtype = w13_compressed.dtype
-        self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=device)
+        # Force a real device. Inheriting `w13_compressed.packed.device`
+        # silently lands pool buffers on meta when _finalize_native_packed_moe
+        # runs while vLLM's meta-init context is still active for the layer.
+        # If the pool is on meta, every subsequent `_bind_real_weight_param`
+        # is a no-op (bind target is itself meta), and the residual-meta
+        # diagnostic surfaces (256, 1024, 2048) w13/w2 leaks per MoE layer.
+        if torch.cuda.is_available():
+            target = torch.device("cuda")
+        else:
+            src = w13_compressed.packed.device
+            target = torch.device("cpu") if src.type == "meta" else src
+        self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=target)
+        self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=target)
+        # Loud failure if a future change re-introduces the meta leak — better
+        # to fail at pool construction than at the 60th residual-meta warning.
+        assert not self.w13.is_meta, "scratch pool w13 on meta despite explicit device"
+        assert not self.w2.is_meta, "scratch pool w2 on meta despite explicit device"
         # The CUDA sparse expert dequant path writes directly into the
         # destination dtype and ignores fp32 scratch. Keep these as
         # lazy/optional placeholders so we don't reserve another full
