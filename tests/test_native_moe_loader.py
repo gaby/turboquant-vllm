@@ -24,6 +24,7 @@ from turboquant_vllm.weight_quant import (
     packed_group_bytes,
 )
 from turboquant_vllm.vllm_quant import (
+    TurboQuantConfig,
     TurboQuantOnlineMoEMethod,
     _finalize_native_packed_moe,
     _materialize_meta_tensors,
@@ -81,6 +82,24 @@ class TestMetaTensorMaterialization(unittest.TestCase):
         self.assertEqual(layer.weight.custom_marker, "keep-me")
         self.assertEqual(layer.scratch.custom_marker, "keep-buffer")
         self.assertTrue(layer._expert_map.is_meta)
+
+
+class TestMoEScratchPoolOwnership(unittest.TestCase):
+    def test_scratch_pool_is_shared_by_config_not_module_global(self):
+        if TurboQuantOnlineMoEMethod is None or TurboQuantConfig is None:
+            self.skipTest("TurboQuant vLLM config unavailable")
+
+        owner_a = TurboQuantConfig(bits=3, group_size=8)
+        owner_b = TurboQuantConfig(bits=3, group_size=8)
+        method_a1 = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_a)
+        method_a2 = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_a)
+        method_b = TurboQuantOnlineMoEMethod(3, 8, object(), scratch_pool_owner=owner_b)
+
+        pool = object()
+        method_a1._set_moe_scratch_pool(pool)
+
+        self.assertIs(method_a2._get_moe_scratch_pool(), pool)
+        self.assertIsNone(method_b._get_moe_scratch_pool())
 
 
 class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):

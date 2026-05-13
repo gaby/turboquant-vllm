@@ -52,10 +52,9 @@ except ImportError:
     UnquantizedFusedMoEMethod = None  # type: ignore[assignment,misc]
 
 
-# Shared scratch pool across all FusedMoE layers — only one MoE layer
-# runs at a time during forward, so one set of bf16 decompression
-# buffers is enough. Per-layer pools would consume 78 × ~5 GB = 390 GB
-# and defeat compression entirely.
+# Fallback scratch pool for direct tests/legacy construction. Normal vLLM
+# model loads keep the pool on the per-model TurboQuantConfig instance so
+# separate LLM objects in one process never share writable dequant buffers.
 _shared_moe_scratch_pool = None
 
 
@@ -84,6 +83,7 @@ if LinearBase is not None:
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
             self.native_packed = native_packed
+            self._moe_scratch_pool = None
 
         def __repr__(self) -> str:
             return (
@@ -130,6 +130,7 @@ if LinearBase is not None:
                         self.group_size,
                         layer.moe_config,
                         native_packed=self.native_packed,
+                        scratch_pool_owner=self,
                     )
             except ImportError:
                 pass
@@ -624,12 +625,19 @@ def _finalize_native_packed_moe(
     setattr(layer, "_tq_w13_weight", w13_c)
     setattr(layer, "_tq_w2_weight", w2_c)
 
-    if _shared_moe_scratch_pool is None:
-        _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(w13_c, w2_c)
+    get_pool = getattr(method, "_get_moe_scratch_pool", None)
+    set_pool = getattr(method, "_set_moe_scratch_pool", None)
+    current_pool = get_pool() if callable(get_pool) else _shared_moe_scratch_pool
+    if current_pool is None:
+        current_pool = TurboQuantFusedMoEScratchPool(w13_c, w2_c)
+        if callable(set_pool):
+            set_pool(current_pool)
+        else:
+            _shared_moe_scratch_pool = current_pool
     else:
-        _shared_moe_scratch_pool.assert_matches(w13_c, w2_c)
+        current_pool.assert_matches(w13_c, w2_c)
 
-    pool = _shared_moe_scratch_pool
+    pool = current_pool
     method._pool = pool
     _bind_real_weight_param("w13_weight", pool.w13)
     _bind_real_weight_param("w2_weight", pool.w2)
@@ -714,15 +722,35 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
         uses_meta_device: bool = True
 
-        def __init__(self, bits: int, group_size: int, moe_config: Any, native_packed: bool = False):
+        def __init__(
+            self,
+            bits: int,
+            group_size: int,
+            moe_config: Any,
+            native_packed: bool = False,
+            scratch_pool_owner: Any | None = None,
+        ):
             super().__init__(moe_config)
             self.bits = bits
             self.group_size = group_size
             self.native_packed = native_packed
+            self._scratch_pool_owner = scratch_pool_owner
+            self._local_moe_scratch_pool = None
             self._unquant = UnquantizedFusedMoEMethod(moe_config)
             self._pool = None
             self._w13_c = None
             self._w2_c = None
+
+        def _get_moe_scratch_pool(self):
+            if self._scratch_pool_owner is not None:
+                return getattr(self._scratch_pool_owner, "_moe_scratch_pool", None)
+            return self._local_moe_scratch_pool
+
+        def _set_moe_scratch_pool(self, pool) -> None:
+            if self._scratch_pool_owner is not None:
+                setattr(self._scratch_pool_owner, "_moe_scratch_pool", pool)
+            else:
+                self._local_moe_scratch_pool = pool
 
         def create_weights(self, layer: nn.Module, **kwargs):
             self._unquant.create_weights(layer, **kwargs)
@@ -872,8 +900,6 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
         def _do_compress(self, layer: nn.Module) -> None:
             """Kernel setup + TQ3 compression. Called after materialization."""
-            global _shared_moe_scratch_pool
-
             from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
             from turboquant_vllm.weight_quant import _compress_3d_param
 
@@ -890,18 +916,20 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             self._w13_c = layer._tq_w13_weight
             self._w2_c = layer._tq_w2_weight
 
-            if _shared_moe_scratch_pool is None:
-                _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(
+            shared_pool = self._get_moe_scratch_pool()
+            if shared_pool is None:
+                shared_pool = TurboQuantFusedMoEScratchPool(
                     self._w13_c,
                     self._w2_c,
                 )
+                self._set_moe_scratch_pool(shared_pool)
             else:
-                _shared_moe_scratch_pool.assert_matches(
+                shared_pool.assert_matches(
                     self._w13_c,
                     self._w2_c,
                 )
 
-            self._pool = _shared_moe_scratch_pool
+            self._pool = shared_pool
             layer.w13_weight.data = self._pool.w13
             layer.w2_weight.data = self._pool.w2
 
