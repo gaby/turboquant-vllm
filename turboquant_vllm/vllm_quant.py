@@ -400,10 +400,44 @@ def _materialize_and_process(
     method._do_compress(layer)
 
 
+_META_MATERIALIZE_SKIP_TENSORS = {
+    "_expert_map",
+    "expert_mask",
+    "expert_global_to_physical",
+    "expert_physical_to_global",
+    "expert_local_to_global",
+    "e_score_correction_bias",
+}
+
+
+def _materialize_meta_tensor_like(meta_tensor: torch.Tensor, target_device: str) -> torch.Tensor:
+    """Materialize a meta tensor without reading from meta storage.
+
+    Mirrors vLLM's reload.meta.materialize_meta_tensor pattern: construct new
+    storage with the same size/stride/dtype, then preserve tensor subclass and
+    custom attrs. Do not use ``.data =`` or ``empty_like(meta, device=...)``;
+    both can route through meta copy/set_data paths and fail for vLLM Parameter
+    subclasses.
+    """
+    tensor = torch.empty_strided(
+        size=tuple(meta_tensor.size()),
+        stride=tuple(meta_tensor.stride()),
+        dtype=meta_tensor.dtype,
+        device=target_device,
+        requires_grad=False,
+    )
+    tensor.zero_()
+    tensor.__class__ = meta_tensor.__class__
+    tensor.__dict__ = meta_tensor.__dict__.copy()
+    return tensor
+
+
 def _materialize_meta_tensors(layer, label: str = ""):
-    """Walk every parameter and buffer on `layer` (recursively through
-    sub-modules), and for each one still on the `meta` device, replace its
-    data with a zero CUDA tensor of the same shape and dtype.
+    """Walk every parameter and buffer on ``layer`` and submodules.
+
+    For each tensor still on ``meta``, replace the owning module slot with a
+    real zero tensor on the active device while preserving stride, subclass and
+    tensor attrs.
 
     Why: vLLM's FusedMoE creates parameter slots up front (some on meta until
     first use). PR #44's native-packed loader rebinds w13_weight/w2_weight to
@@ -420,76 +454,85 @@ def _materialize_meta_tensors(layer, label: str = ""):
     materialized: list[str] = []
     failed: list[str] = []
 
-    # PyTorch's `empty_like(meta_tensor, device=cuda)` and `meta_tensor.to(cuda)`
-    # both fail with "Cannot copy out of meta tensor; no data!" — they take an
-    # internal copy path that requires the source's storage. The right idiom
-    # is `torch.empty(shape, dtype, device, layout)` directly: pure construction
-    # with no source-tensor data dependency.
-    #
-    # When .data swap is rejected by a subclass's strict set_data check
-    # (vLLM has many Parameter subclasses with custom layout assertions),
-    # fall back to replacing the whole Parameter object via the owning
-    # module's _parameters dict, preserving subclass type and weight_loader.
-    def _try_materialize(owner_module, attr_name, param):
-        if not isinstance(param, torch.nn.Parameter) or not param.is_meta:
+    def _try_materialize(owner_module, store_name: str, attr_name: str, tensor: torch.Tensor | None):
+        if tensor is None or not isinstance(tensor, torch.Tensor) or not tensor.is_meta:
             return
-        # Allocate fresh uninitialized CUDA storage. No source-data copy.
-        new_data = torch.empty(
-            param.shape, dtype=param.dtype, device=target_device, layout=param.layout
-        )
-        new_data.zero_()  # zeros are safe for the buffer/staging slots that
-                          # never get materialized real values before our
-                          # _replace_quant_method swap routes around them.
-
-        # Path 1: in-place .data swap (preserves subclass identity and attrs).
-        try:
-            param.data = new_data
-            materialized.append(f"{owner_module.__class__.__name__}.{attr_name}")
+        if attr_name in _META_MATERIALIZE_SKIP_TENSORS:
             return
-        except RuntimeError:
-            pass
-
-        # Path 2: replace the whole Parameter via owning module's _parameters
-        # dict. Try to keep the subclass; if its __init__ won't accept
-        # (data, requires_grad=False), fall back to plain nn.Parameter.
-        new_param = None
         try:
-            new_param = type(param)(new_data, requires_grad=False)
-        except TypeError:
-            try:
-                new_param = torch.nn.Parameter(new_data, requires_grad=False)
-            except Exception as e:
-                failed.append(f"{attr_name} (constructor: {type(e).__name__}: {e})")
-                return
-        # Preserve vLLM's loader hooks so downstream code keeps working.
-        for attr in ("weight_loader", "output_dim", "input_dim", "is_metadata"):
-            if hasattr(param, attr):
-                try:
-                    setattr(new_param, attr, getattr(param, attr))
-                except Exception:
-                    pass
-        owner_module._parameters[attr_name] = new_param
-        materialized.append(f"{owner_module.__class__.__name__}.{attr_name} (full-replace)")
+            new_tensor = _materialize_meta_tensor_like(tensor, target_device)
+        except Exception as e:
+            failed.append(f"{store_name}:{attr_name} ({type(e).__name__}: {e})")
+            return
+        getattr(owner_module, store_name)[attr_name] = new_tensor
+        materialized.append(f"{store_name}:{owner_module.__class__.__name__}.{attr_name}")
 
-    # Walk every module (layer itself + sub-modules) and its direct params.
     for _mod_name, sub in layer.named_modules():
-        for p_name in list(sub._parameters.keys()):
-            param = sub._parameters[p_name]
-            if param is not None:
-                _try_materialize(sub, p_name, param)
+        for p_name, param in list(sub._parameters.items()):
+            _try_materialize(sub, "_parameters", p_name, param)
+        for b_name, buf in list(sub._buffers.items()):
+            _try_materialize(sub, "_buffers", b_name, buf)
 
     if failed:
         logger.warning(
-            "TurboQuant native-packed MoE finalize (%s): could not materialize %d params: %s",
-            label, len(failed), failed[:10],
+            "TurboQuant native-packed MoE finalize (%s): could not materialize %d tensors: %s",
+            label,
+            len(failed),
+            failed[:10],
         )
 
     if materialized:
         logger.info(
             "TurboQuant native-packed MoE finalize (%s): materialized %d meta tensors: %s",
-            label, len(materialized), materialized[:20],
+            label,
+            len(materialized),
+            materialized[:20],
         )
     return materialized
+
+
+def _collect_residual_meta_tensors(obj, prefix: str, max_depth: int = 4) -> list[str]:
+    """Debug collector for meta tensors reachable from MoE runtime objects."""
+    seen: set[int] = set()
+    hits: list[str] = []
+
+    def _walk(value, path: str, depth: int) -> None:
+        obj_id = id(value)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+        if isinstance(value, torch.Tensor):
+            if value.is_meta:
+                hits.append(f"{path}: shape={tuple(value.shape)} dtype={value.dtype}")
+            return
+        if value is None or depth >= max_depth:
+            return
+        if isinstance(value, (str, bytes, int, float, bool, torch.dtype, torch.device)):
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                _walk(item, f"{path}.{key}", depth + 1)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for idx, item in enumerate(value):
+                _walk(item, f"{path}[{idx}]", depth + 1)
+            return
+        if isinstance(value, torch.nn.Module):
+            for name, param in value._parameters.items():
+                _walk(param, f"{path}._parameters.{name}", depth + 1)
+            for name, buf in value._buffers.items():
+                _walk(buf, f"{path}._buffers.{name}", depth + 1)
+            for name, sub in value._modules.items():
+                _walk(sub, f"{path}.{name}", depth + 1)
+            return
+        if hasattr(value, "__dict__"):
+            for name, item in vars(value).items():
+                if name.startswith("__"):
+                    continue
+                _walk(item, f"{path}.{name}", depth + 1)
+
+    _walk(obj, prefix, 0)
+    return hits
 
 
 def _finalize_native_packed_moe(
@@ -505,7 +548,6 @@ def _finalize_native_packed_moe(
         _HAS_FUSED_MOE,
         TurboQuantFusedMoEMethod,
         TurboQuantFusedMoEScratchPool,
-        _collect_meta_tensors,
     )
     from turboquant_vllm.weight_quant import Compressed3D, packed_group_bytes, padded_size
 
@@ -596,6 +638,20 @@ def _finalize_native_packed_moe(
     # so the kernel sees the live pool tensors.
     _bind_real_weight_param("w13_weight", pool.w13)
     _bind_real_weight_param("w2_weight", pool.w2)
+
+    residual_meta = []
+    residual_meta.extend(_collect_residual_meta_tensors(layer, "layer"))
+    runner = getattr(layer, "runner", None)
+    if runner is not None:
+        residual_meta.extend(_collect_residual_meta_tensors(runner, "layer.runner"))
+    moe_kernel = getattr(method._unquant, "moe_kernel", None)
+    if moe_kernel is not None:
+        residual_meta.extend(_collect_residual_meta_tensors(moe_kernel, "method._unquant.moe_kernel"))
+    if residual_meta:
+        logger.warning(
+            "TurboQuant native-packed MoE finalize: residual meta tensors after materialization: %s",
+            residual_meta[:30],
+        )
 
     for name in (
         "w13_weight_tq_packed",

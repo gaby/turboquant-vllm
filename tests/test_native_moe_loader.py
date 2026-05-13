@@ -26,6 +26,7 @@ from turboquant_vllm.weight_quant import (
 from turboquant_vllm.vllm_quant import (
     TurboQuantOnlineMoEMethod,
     _finalize_native_packed_moe,
+    _materialize_meta_tensors,
     _maybe_flush_native_moe_target,
     _regroup_native_moe_packed_tensors,
     _collect_meta_params,
@@ -50,6 +51,36 @@ class TestPackedGroupBytes(unittest.TestCase):
     def test_2bit(self):
         self.assertEqual(packed_group_bytes(2, 128), 32)
         self.assertEqual(packed_group_bytes(2, 64), 16)
+
+
+class TestMetaTensorMaterialization(unittest.TestCase):
+    def test_materialize_meta_params_and_buffers_preserves_attrs_and_stride(self):
+        layer = nn.Module()
+        param = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        param.custom_marker = "keep-me"
+        layer.register_parameter("weight", param)
+
+        buf = torch.empty_strided((3, 2), (1, 3), device="meta")
+        buf.custom_marker = "keep-buffer"
+        layer.register_buffer("scratch", buf)
+
+        skipped = torch.empty(4, device="meta", dtype=torch.int32)
+        layer.register_buffer("_expert_map", skipped)
+
+        materialized = _materialize_meta_tensors(layer, label="unit-test")
+
+        self.assertIn("_parameters:Module.weight", materialized)
+        self.assertIn("_buffers:Module.scratch", materialized)
+        self.assertFalse(layer.weight.is_meta)
+        self.assertFalse(layer.scratch.is_meta)
+        self.assertEqual(layer.weight.stride(), (1, 2))
+        self.assertEqual(layer.scratch.stride(), (1, 3))
+        self.assertEqual(layer.weight.custom_marker, "keep-me")
+        self.assertEqual(layer.scratch.custom_marker, "keep-buffer")
+        self.assertTrue(layer._expert_map.is_meta)
 
 
 class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
