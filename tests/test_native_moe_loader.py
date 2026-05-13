@@ -520,6 +520,70 @@ class TestNativeMoEPackedRegroup(unittest.TestCase):
         self.assertFalse(layer.w13_weight.is_meta)
         self.assertFalse(layer.w2_weight.is_meta)
 
+    def test_finalize_native_packed_moe_swaps_w13_for_flashinfer_cutlass(self):
+        bits = 3
+        group_size = 8
+        w13 = torch.randn(2, 8, 8)
+        w2 = torch.randn(2, 4, 8)
+
+        class _MoeConfig:
+            is_act_and_mul = True
+
+        class _FinalizeLayer(_FakeExperts):
+            def __init__(self):
+                super().__init__()
+                self.moe_config = _MoeConfig()
+
+        layer = _FinalizeLayer()
+        w13_comp = Compressed3D(w13, bits=bits, group_size=group_size)
+        w2_comp = Compressed3D(w2, bits=bits, group_size=group_size)
+
+        layer.register_parameter(
+            "w13_weight_tq_packed",
+            nn.Parameter(w13_comp.packed.reshape(16, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w13_weight_tq_norms",
+            nn.Parameter(w13_comp.norms.clone(), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_packed",
+            nn.Parameter(w2_comp.packed.reshape(8, -1), requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_tq_norms",
+            nn.Parameter(w2_comp.norms.clone(), requires_grad=False),
+        )
+
+        class _Backend:
+            name = "FLASHINFER_CUTLASS"
+
+        class _FakeUnquant:
+            unquantized_backend = _Backend()
+
+            def process_weights_after_loading(self, _layer):
+                return None
+
+        class _FakeMethod:
+            def __init__(self):
+                self.bits = bits
+                self.group_size = group_size
+                self._unquant = _FakeUnquant()
+
+        _finalize_native_packed_moe(
+            layer,
+            _FakeMethod(),
+            {"w13_weight": (2, 8, 8), "w2_weight": (2, 4, 8)},
+            {"w13_weight": torch.float32, "w2_weight": torch.float32},
+        )
+
+        packed = w13_comp.packed.reshape(2, 8, w13_comp.n_groups, -1)
+        norms = w13_comp.norms.reshape(2, 8, w13_comp.n_groups)
+        expected_packed = torch.cat((packed[:, 4:], packed[:, :4]), dim=1).reshape_as(layer._tq_w13_weight.packed)
+        expected_norms = torch.cat((norms[:, 4:], norms[:, :4]), dim=1).reshape_as(layer._tq_w13_weight.norms)
+        self.assertTrue(torch.equal(layer._tq_w13_weight.packed, expected_packed))
+        self.assertTrue(torch.equal(layer._tq_w13_weight.norms, expected_norms))
+
     def test_finalize_native_packed_moe_replaces_layer_quant_method(self):
         if not _HAS_FUSED_MOE:
             self.skipTest("vLLM fused MoE not available in local test environment")

@@ -575,6 +575,31 @@ def _finalize_native_packed_moe(
             f"({total_rows * n_groups}, {pgb}) or ({total_rows}, {n_groups * pgb})"
         )
 
+    def _backend_name() -> str:
+        backend = getattr(method._unquant, "unquantized_backend", None)
+        return str(getattr(backend, "name", backend))
+
+    def _needs_w13_w31_layout() -> bool:
+        return _backend_name() == "FLASHINFER_CUTLASS" and bool(getattr(layer.moe_config, "is_act_and_mul", True))
+
+    def _swap_w13_to_w31_compressed(w13: Compressed3D) -> Compressed3D:
+        n_experts, out_dim, _in_dim = w13.shape
+        if out_dim % 2 != 0:
+            raise ValueError(f"Cannot swap gated w13 with odd out_dim: {w13.shape}")
+        half = out_dim // 2
+        packed = w13.packed.reshape(n_experts, out_dim, w13.n_groups, -1)
+        norms = w13.norms.reshape(n_experts, out_dim, w13.n_groups)
+        packed = torch.cat((packed[:, half:], packed[:, :half]), dim=1).reshape_as(w13.packed)
+        norms = torch.cat((norms[:, half:], norms[:, :half]), dim=1).reshape_as(w13.norms)
+        return Compressed3D.from_packed(
+            packed.contiguous(),
+            norms.contiguous(),
+            shape=w13.shape,
+            dtype=w13.dtype,
+            bits=w13.bits,
+            group_size=w13.group_size,
+        )
+
     w13_c = Compressed3D.from_packed(
         _normalize_packed_layout(getattr(layer, "w13_weight_tq_packed").data, param_shapes["w13_weight"]),
         getattr(layer, "w13_weight_tq_norms").data,
@@ -591,6 +616,8 @@ def _finalize_native_packed_moe(
         bits=method.bits,
         group_size=method.group_size,
     )
+    if _needs_w13_w31_layout():
+        w13_c = _swap_w13_to_w31_compressed(w13_c)
 
     method._w13_c = w13_c
     method._w2_c = w2_c
