@@ -162,8 +162,7 @@ def compress_and_export(
         if len(unsupported_moe) > 4:
             preview += ", ..."
         raise NotImplementedError(
-            "AWQ export does not support MoE expert tensors yet. "
-            f"Found {len(unsupported_moe)} 3D tensor(s): {preview}"
+            f"AWQ export does not support MoE expert tensors yet. Found {len(unsupported_moe)} 3D tensor(s): {preview}"
         )
 
     # Step 3: Export each linear layer to AWQ format

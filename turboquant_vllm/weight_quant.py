@@ -789,8 +789,7 @@ class Compressed3D:
             )
         if packed.device != norms.device:
             raise ValueError(
-                f"Compressed3D.from_packed expected packed/norms on same device, "
-                f"got {packed.device} and {norms.device}"
+                f"Compressed3D.from_packed expected packed/norms on same device, got {packed.device} and {norms.device}"
             )
         obj.shape = shape
         obj.dtype = dtype
