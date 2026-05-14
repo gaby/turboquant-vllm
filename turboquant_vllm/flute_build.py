@@ -54,7 +54,7 @@ def _cuda_version_tuple() -> tuple[int, int]:
     import torch
 
     v = getattr(torch.version, "cuda", None) or "0.0"
-    parts = str(v).split(".")
+    parts = v.split(".")
     try:
         major = int(parts[0])
     except (TypeError, ValueError):
