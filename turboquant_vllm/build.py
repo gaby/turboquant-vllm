@@ -43,7 +43,7 @@ def _cuda_version_tuple():
     parts = str(v).split(".")
     try:
         major = int(parts[0])
-    except (IndexError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return (0, 0)
     try:
         minor = int(parts[1]) if len(parts) > 1 else 0
