@@ -215,6 +215,7 @@ if LinearBase is not None:
                 _tq_fwht_input_fn,
                 _triton_available,
                 pack_indices,
+                packed_group_bytes,
                 padded_size,
             )
 
@@ -260,7 +261,7 @@ if LinearBase is not None:
             # cudaGetDeviceProperties query.
             arch_ok = torch.cuda.is_available() and torch.cuda.get_device_capability(weight.device)[0] >= 8
             if bits == 3 and group_size == 128 and arch_ok:
-                bytes_per_group = group_size * bits // 8
+                bytes_per_group = packed_group_bytes(bits, group_size)
                 layer.register_buffer(
                     "tq_packed_bs1",
                     packed.view(out_dim * n_groups, bytes_per_group),
