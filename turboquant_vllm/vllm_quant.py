@@ -552,47 +552,48 @@ def _collect_residual_meta_tensors(obj, prefix: str, max_depth: int = 4) -> list
 
 def _resolve_native_moe_shape(
     packed: torch.Tensor,
+    norms: torch.Tensor,
     shape: tuple[int, int, int],
     bits: int,
     group_size: int,
 ) -> tuple[int, int, int]:
     """Resolve the true (n_experts, out_dim, in_dim) of a native-packed MoE
-    weight from the actual packed tensor.
+    weight from the norms tensor (the authoritative quant metadata), not the
+    registered ``shape``.
 
-    Standard FusedMoE models register ``w13_weight`` with the gate_up-fused
-    out_dim (2 * moe_intermediate_size). DeepSeek-V4-Flash registers it with
-    the un-fused out_dim (moe_intermediate_size) while the native TQ3
-    checkpoint still packs the fused gate_up tensor, so the registered
-    ``shape`` under-reports out_dim by 2x. The packed tensor is ground
-    truth: derive out_dim from it and accept only ``out_dim`` (standard) or
-    ``2 * out_dim`` (gated w13 under-reported). Anything else returns the
-    original ``shape`` unchanged, so the downstream validators raise their
-    precise errors instead of silently accepting a wrong layout.
+    DeepSeek-V4-Flash registers MoE weights with shapes that mis-report
+    out_dim (w13 is registered un-fused / half) and in_dim (w2), while the
+    native TQ3 checkpoint packs the true gate_up-fused, full-width tensors.
+    The packer always lays norms out as exactly ``(n_experts * out_dim,
+    n_groups)``, so it recovers both dims independent of the registered
+    shape. n_experts (expert count) and group_size are structurally
+    unambiguous and trusted. If the packed tensor is inconsistent with the
+    norms-derived layout, the original ``shape`` is returned unchanged so
+    the downstream validators raise their precise errors instead of masking
+    corruption. For well-formed (standard) models norms already matches the
+    registered shape, so this is a no-op.
     """
     from turboquant_vllm.weight_quant import packed_group_bytes, padded_size
 
-    n_experts, out_dim, in_dim = shape
-    if packed.ndim != 2:
+    n_experts, _p_out, p_in = shape
+    if norms.ndim != 2 or packed.ndim != 2 or n_experts <= 0:
         return shape
-    _, n_groups = padded_size(in_dim, group_size)
+    total_rows, n_groups = norms.shape
+    if n_groups <= 0 or total_rows <= 0 or total_rows % n_experts != 0:
+        return shape
+    out_dim = total_rows // n_experts
     pgb = packed_group_bytes(bits, group_size)
-    if pgb <= 0 or n_groups <= 0 or n_experts <= 0:
-        return shape
-    numel = packed.numel()
-    if numel % pgb != 0:
-        return shape
-    rows = numel // pgb
-    if rows % n_groups != 0:
-        return shape
-    total_rows = rows // n_groups
-    if total_rows % n_experts != 0:
-        return shape
-    true_out_dim = total_rows // n_experts
-    if true_out_dim == out_dim:
-        return shape
-    if true_out_dim == 2 * out_dim:
-        return (n_experts, true_out_dim, in_dim)
-    return shape
+    if pgb <= 0 or packed.numel() != total_rows * n_groups * pgb:
+        return shape  # packed inconsistent with norms -> let from_packed raise
+    # Keep the registered in_dim when it is consistent with the
+    # norms-derived n_groups (preserves the exact in_dim, incl. padding,
+    # for well-formed models); otherwise the registered shape is unreliable
+    # (DSV4) and DSV4 MoE dims are group_size-aligned.
+    if padded_size(p_in, group_size)[1] == n_groups:
+        in_dim = p_in
+    else:
+        in_dim = n_groups * group_size
+    return (n_experts, out_dim, in_dim)
 
 
 def _finalize_native_packed_moe(
@@ -661,24 +662,26 @@ def _finalize_native_packed_moe(
         )
 
     w13_packed = getattr(layer, "w13_weight_tq_packed").data
+    w13_norms = getattr(layer, "w13_weight_tq_norms").data
     w13_shape = _resolve_native_moe_shape(
-        w13_packed, param_shapes["w13_weight"], method.bits, method.group_size
+        w13_packed, w13_norms, param_shapes["w13_weight"], method.bits, method.group_size
     )
     w13_c = Compressed3D.from_packed(
         _normalize_packed_layout(w13_packed, w13_shape),
-        getattr(layer, "w13_weight_tq_norms").data,
+        w13_norms,
         shape=w13_shape,
         dtype=param_dtypes["w13_weight"],
         bits=method.bits,
         group_size=method.group_size,
     )
     w2_packed = getattr(layer, "w2_weight_tq_packed").data
+    w2_norms = getattr(layer, "w2_weight_tq_norms").data
     w2_shape = _resolve_native_moe_shape(
-        w2_packed, param_shapes["w2_weight"], method.bits, method.group_size
+        w2_packed, w2_norms, param_shapes["w2_weight"], method.bits, method.group_size
     )
     w2_c = Compressed3D.from_packed(
         _normalize_packed_layout(w2_packed, w2_shape),
-        getattr(layer, "w2_weight_tq_norms").data,
+        w2_norms,
         shape=w2_shape,
         dtype=param_dtypes["w2_weight"],
         bits=method.bits,
