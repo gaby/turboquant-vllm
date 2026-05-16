@@ -1466,7 +1466,11 @@ def _patch_weight_name_remapping():
                 skipped_fp8_scales += 1
                 continue
             else:
-                yield name, tensor
+                # Yield the RAW (pre-mapper) name. vLLM's AutoWeightsLoader
+                # applies hf_to_vllm_mapper once itself; yielding the mapped
+                # `name` here makes it map twice, which corrupts non-idempotent
+                # rules (e.g. DSV4 head.weight -> lm_head.weight -> lm_lm_head).
+                yield raw_name, tensor
                 continue
 
             # When both halves of a pair arrive, decompress and yield
