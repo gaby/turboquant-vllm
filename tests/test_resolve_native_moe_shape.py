@@ -60,21 +60,18 @@ class TestResolveNativeMoEShape(unittest.TestCase):
         """The resolved shape must yield a semantically valid Compressed3D
         (decompress matches the original), for both w13 and w2."""
         for data_out, data_in, bad_shape in (
-            (2 * I, H, (E, I, H)),       # w13: out under-reported
-            (H, I, (E, H, I // 2)),      # w2: in under-reported
+            (2 * I, H, (E, I, H)),  # w13: out under-reported
+            (H, I, (E, H, I // 2)),  # w2: in under-reported
         ):
             data, comp = _comp(data_out, data_in)
             ref = comp.decompress()
             resolved = _resolve(comp, bad_shape)
-            rebuilt = Compressed3D.from_packed(
-                comp.packed, comp.norms, resolved, data.dtype, BITS, GS
-            )
+            rebuilt = Compressed3D.from_packed(comp.packed, comp.norms, resolved, data.dtype, BITS, GS)
             out = rebuilt.decompress()
             self.assertEqual(ref.shape, out.shape)
             self.assertTrue(
                 torch.allclose(ref, out),
-                f"{bad_shape}: decompress diverged "
-                f"{(ref - out).abs().max():.6g}",
+                f"{bad_shape}: decompress diverged {(ref - out).abs().max():.6g}",
             )
 
     def test_inconsistent_packed_not_silently_accepted(self):
@@ -82,9 +79,7 @@ class TestResolveNativeMoEShape(unittest.TestCase):
         so the downstream validator raises (no silent corruption)."""
         _d, comp = _comp(2 * I, H)
         bad_packed = comp.packed[:-1]  # numel no longer matches norms
-        resolved = _resolve_native_moe_shape(
-            bad_packed, comp.norms, (E, I, H), BITS, GS
-        )
+        resolved = _resolve_native_moe_shape(bad_packed, comp.norms, (E, I, H), BITS, GS)
         self.assertEqual(resolved, (E, I, H))  # unchanged -> downstream raises
 
     def test_idempotent(self):

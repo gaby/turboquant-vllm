@@ -186,8 +186,7 @@ def _prebuilt_is_compatible(path: Path) -> bool:
 
     if _env_flag("TQ_CUDA_ALLOW_UNVERIFIED_PREBUILT"):
         logger.warning(
-            "TQ_CUDA_ALLOW_UNVERIFIED_PREBUILT=1: using %s without SM coverage verification "
-            "for local arches %s",
+            "TQ_CUDA_ALLOW_UNVERIFIED_PREBUILT=1: using %s without SM coverage verification for local arches %s",
             path,
             sorted(local_arches, key=int),
         )

@@ -676,9 +676,7 @@ def _finalize_native_packed_moe(
     )
     w2_packed = getattr(layer, "w2_weight_tq_packed").data
     w2_norms = getattr(layer, "w2_weight_tq_norms").data
-    w2_shape = _resolve_native_moe_shape(
-        w2_packed, w2_norms, param_shapes["w2_weight"], method.bits, method.group_size
-    )
+    w2_shape = _resolve_native_moe_shape(w2_packed, w2_norms, param_shapes["w2_weight"], method.bits, method.group_size)
     w2_c = Compressed3D.from_packed(
         _normalize_packed_layout(w2_packed, w2_shape),
         w2_norms,
