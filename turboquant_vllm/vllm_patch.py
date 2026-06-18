@@ -283,6 +283,58 @@ def _make_mla_patched_forward(original_fn, cache_arg_idx):
     return patched
 
 
+# Sparse MLA backends (vllm-project/vllm#38476, TRITON_MLA_SPARSE) ship the impl
+# as a sibling of MLAAttentionImpl, not a subclass of MLACommonImpl, so the
+# base-class patch does not reach them and the concrete class must be patched
+# directly. The PR is unmerged and its import path is not yet stable, so try the
+# known locations in order and use the first that resolves.
+_SPARSE_MLA_CANDIDATES = (
+    # Path reported working by a #38476-branch user (turboquant-vllm issue #56).
+    ("vllm.v1.attention.backend", "SparseMLAAttentionImpl"),
+    # Plausible locations if the PR is reorganized into the v1 backends package.
+    ("vllm.v1.attention.backends", "SparseMLAAttentionImpl"),
+    ("vllm.v1.attention.backends.mla.sparse_mla", "SparseMLAAttentionImpl"),
+)
+
+
+def _patch_mla_impl(impl_cls, method_names, label, patched_backends):
+    """Wrap an MLA-style impl's KV cache update and forward methods.
+
+    Shared by the MLACommonImpl base class and by concrete sparse-MLA impls that
+    do not inherit through it. method_names are guarded with hasattr, so an impl
+    that defines only forward_mqa (decode-only) is still patched correctly.
+    """
+    import inspect
+
+    impl_cls.do_kv_cache_update = _make_mla_patched_cache_update(impl_cls.do_kv_cache_update)
+    for method_name in method_names:
+        if not hasattr(impl_cls, method_name):
+            continue
+        fn = getattr(impl_cls, method_name)
+        params = list(inspect.signature(fn).parameters.keys())
+        cache_idx = next((i for i, p in enumerate(params) if "cache" in p.lower()), None)
+        if cache_idx is None:
+            logger.warning("Could not find cache param in %s.%s, skipping", label, method_name)
+            continue
+        setattr(impl_cls, method_name, _make_mla_patched_forward(fn, cache_idx - 1))
+    patched_backends.append(label)
+
+
+def _resolve_sparse_mla_impl():
+    """Return the sparse-MLA impl class if vllm #38476 is installed, else None."""
+    import importlib
+
+    for module_path, cls_name in _SPARSE_MLA_CANDIDATES:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        impl_cls = getattr(module, cls_name, None)
+        if impl_cls is not None:
+            return impl_cls
+    return None
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -300,8 +352,9 @@ def patch_vllm_attention(
 ):
     """Monkey-patch vLLM attention backends for TurboQuant+ KV cache.
 
-    Call before starting the vLLM engine. Patches both FlashAttention (standard
-    models) and TritonMLA (GLM-4.7, DeepSeek-V3) if available.
+    Call before starting the vLLM engine. Patches FlashAttention (standard
+    models), MLA via MLACommonImpl (GLM-4.7, DeepSeek-V3), and the sparse-MLA
+    backend from vllm-project/vllm#38476 if any are available.
 
     Args:
         k_bits: Bits for key compression (default 4, 16 centroids).
@@ -351,22 +404,20 @@ def patch_vllm_attention(
     # Patch MLA at the common base class so all MLA backends
     # (TritonMLA, FlashAttnMLA, FlashMLA, etc.) are covered.
     try:
-        import inspect
         from vllm.model_executor.layers.attention.mla_attention import MLACommonImpl
 
-        MLACommonImpl.do_kv_cache_update = _make_mla_patched_cache_update(MLACommonImpl.do_kv_cache_update)
-        for method_name in ("forward_mha", "forward_mqa"):
-            if hasattr(MLACommonImpl, method_name):
-                fn = getattr(MLACommonImpl, method_name)
-                params = list(inspect.signature(fn).parameters.keys())
-                cache_idx = next((i for i, p in enumerate(params) if "cache" in p.lower()), None)
-                if cache_idx is None:
-                    logger.warning("Could not find cache param in %s, skipping", method_name)
-                    continue
-                setattr(MLACommonImpl, method_name, _make_mla_patched_forward(fn, cache_idx - 1))
-        patched_backends.append("MLA")
+        _patch_mla_impl(MLACommonImpl, ("forward_mha", "forward_mqa"), "MLA", patched_backends)
     except ImportError:
         logger.warning("MLACommonImpl not found, skipping MLA patch")
+
+    # Sparse MLA (vllm-project/vllm#38476) is a sibling of MLAAttentionImpl, not
+    # a subclass of MLACommonImpl, so the base-class patch above does not reach
+    # it. Patch the concrete class directly when present; skip quietly otherwise.
+    sparse_mla_cls = _resolve_sparse_mla_impl()
+    if sparse_mla_cls is not None:
+        _patch_mla_impl(sparse_mla_cls, ("forward_mha", "forward_mqa"), "SparseMLA", patched_backends)
+    else:
+        logger.debug("Sparse MLA backend not present (vllm #38476), skipping")
 
     if not patched_backends:
         raise ImportError("No vLLM attention backends found. Is vLLM installed?")
