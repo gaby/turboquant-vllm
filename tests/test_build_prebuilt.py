@@ -87,6 +87,19 @@ def test_gencode_override_skips_uncompilable_arch(monkeypatch, no_arch_override)
     assert tq_build._gencode_flags() == ["-gencode=arch=compute_90,code=sm_90"]
 
 
+def test_gencode_override_accepts_torch_space_separated_format(monkeypatch, no_arch_override):
+    """TORCH_CUDA_ARCH_LIST conventionally uses spaces and '+PTX' suffixes."""
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0 9.0+PTX")
+    monkeypatch.setattr(tq_build, "_cuda_version_tuple", lambda: (12, 4))
+    monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
+
+    assert tq_build._gencode_flags() == [
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_90,code=compute_90",
+    ]
+
+
 def test_gencode_fallback_list_per_cuda_version(monkeypatch, no_arch_override):
     monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
 
@@ -113,6 +126,17 @@ def test_gencode_fallback_unknown_cuda_stays_conservative(monkeypatch, no_arch_o
     flags = tq_build._gencode_flags()
 
     assert tq_build._arches_from_gencode_flags(flags) == ["80", "86", "89", "90"]
+    assert tq_build._ptx_arches_from_gencode_flags(flags) == ["80"]
+
+
+def test_gencode_fallback_gates_base_arches_on_old_toolkit(monkeypatch, no_arch_override):
+    """CUDA 11.0 cannot compile compute_89/90 — the fallback must degrade, not fail nvcc."""
+    monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
+    monkeypatch.setattr(tq_build, "_cuda_version_tuple", lambda: (11, 0))
+
+    flags = tq_build._gencode_flags()
+
+    assert tq_build._arches_from_gencode_flags(flags) == ["80"]
     assert tq_build._ptx_arches_from_gencode_flags(flags) == ["80"]
 
 

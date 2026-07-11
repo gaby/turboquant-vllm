@@ -10,6 +10,7 @@ a shared library that can be loaded as a PyTorch extension.
 import logging
 import json
 import os
+import re
 import shutil
 from importlib import util as importlib_util
 from pathlib import Path
@@ -105,6 +106,11 @@ _ARCH_MIN_CUDA: dict[int, tuple[int, int]] = {
 # not a sensible base for discrete GPUs.
 _PTX_FALLBACK_CANDIDATES = (120, 103, 100, 90, 89, 86, 80, 75, 70)
 
+# CUDA 13.0 removed every pre-Turing target; sm_75 is that toolchain's
+# minimum. Bump this (or generalize to a per-arch removal map) when a future
+# major CUDA release drops more targets.
+_CUDA13_MIN_ARCH = 75
+
 
 def _arch_supported_by_cuda(arch_num: int, cuda_version: tuple[int, int]) -> bool:
     """Whether the nvcc toolkit at ``cuda_version`` can compile ``arch_num``.
@@ -116,8 +122,7 @@ def _arch_supported_by_cuda(arch_num: int, cuda_version: tuple[int, int]) -> boo
         return True
     if cuda_version < _ARCH_MIN_CUDA.get(arch_num, (0, 0)):
         return False
-    # CUDA 13.0 removed all pre-Turing targets (minimum is sm_75).
-    if cuda_version >= (13, 0) and arch_num < 75:
+    if cuda_version >= (13, 0) and arch_num < _CUDA13_MIN_ARCH:
         return False
     return True
 
@@ -144,11 +149,17 @@ def _gencode_flags() -> list[str]:
 
     override = os.environ.get("TQ_CUDA_ARCH_LIST") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if override:
-        arch_tokens = [tok.strip() for tok in override.replace(";", ",").split(",") if tok.strip()]
+        # TORCH_CUDA_ARCH_LIST conventionally separates entries with spaces
+        # ("8.0 9.0+PTX"), but commas/semicolons are also seen in the wild.
+        arch_tokens = [tok for tok in re.split(r"[,;\s]+", override) if tok]
         flags: list[str] = []
         for token in arch_tokens:
+            wants_ptx = token.upper().endswith("+PTX")
+            if wants_ptx:
+                token = token[: -len("+PTX")]
             token = token.replace(".", "")
             if not token.isdigit():
+                logger.warning("Ignoring unrecognized CUDA arch token %r in arch-list override", token)
                 continue
             arch_num = int(token)
             if not _arch_supported_by_cuda(arch_num, cuda_version):
@@ -159,6 +170,8 @@ def _gencode_flags() -> list[str]:
                 )
                 continue
             flags.append(_sass_flag(arch_num))
+            if wants_ptx:
+                flags.append(_ptx_flag(arch_num))
         if flags:
             return flags
 
@@ -200,17 +213,25 @@ def _gencode_flags() -> list[str]:
     # Fallback for environments where no GPU is visible during build: cover
     # the common datacenter/workstation SASS targets the toolkit supports,
     # plus one PTX target for forward compatibility with newer arches.
+    # With an unknown toolkit version, stay conservative: pre-Blackwell SASS
+    # only (matching the historical list), since we can't prove newer
+    # compute_XXX targets are compilable.
+    known_version = cuda_version > (0, 0)
     flags = [
-        _sass_flag(80),
-        _sass_flag(86),
-        _sass_flag(89),
-        _sass_flag(90),
+        _sass_flag(arch_num)
+        for arch_num in (80, 86, 89, 90)
+        if not known_version or _arch_supported_by_cuda(arch_num, cuda_version)
     ]
-    if cuda_version > (0, 0):
-        for arch_num in (100, 103, 120, 121):
-            if _arch_supported_by_cuda(arch_num, cuda_version):
-                flags.append(_sass_flag(arch_num))
-    if _arch_supported_by_cuda(90, cuda_version) and cuda_version >= (11, 8):
+    if known_version:
+        flags.extend(
+            _sass_flag(arch_num)
+            for arch_num in (100, 103, 120, 121)  # sm_110/Thor is embedded-only; use the env override for it
+            if _arch_supported_by_cuda(arch_num, cuda_version)
+        )
+    # compute_90 PTX needs CUDA >= 11.8; older or unknown toolchains get
+    # compute_80 PTX (torch >= 2.1 ships CUDA >= 11.8, so this branch is
+    # exotic-toolchain insurance).
+    if known_version and cuda_version >= (11, 8):
         flags.append(_ptx_flag(90))
     else:
         flags.append(_ptx_flag(80))
@@ -268,14 +289,6 @@ def _parse_manifest_arches(raw) -> set[str]:
     return {arch for arch in parsed if arch.isdigit()}
 
 
-def _read_prebuilt_arches(path: Path) -> set[str] | None:
-    """Return the SASS arches from the sidecar manifest, or None if unusable."""
-    manifest = _read_prebuilt_manifest(path)
-    if manifest is None:
-        return None
-    return manifest[0]
-
-
 def _read_prebuilt_manifest(path: Path) -> tuple[set[str], set[str]] | None:
     """Return ``(sass_arches, ptx_arches)`` from the sidecar manifest.
 
@@ -297,7 +310,12 @@ def _read_prebuilt_manifest(path: Path) -> tuple[set[str], set[str]] | None:
     return _parse_manifest_arches(data.get("arches")), _parse_manifest_arches(data.get("ptx"))
 
 
-def _prebuilt_is_compatible(path: Path) -> bool:
+# Sentinel distinguishing "manifest not read yet" from "manifest file
+# absent/unusable" (None) in _prebuilt_is_compatible's optional parameter.
+_MANIFEST_UNREAD = object()
+
+
+def _prebuilt_is_compatible(path: Path, manifest=_MANIFEST_UNREAD) -> bool:
     """Return whether ``path`` is safe to use on this host.
 
     A prebuilt extension can import successfully even when it was not built
@@ -307,6 +325,9 @@ def _prebuilt_is_compatible(path: Path) -> bool:
     targets compiled into the shared object. If a CUDA device is visible, the
     prebuilt must prove it covers every local SM unless the user explicitly
     opts into unverified loading.
+
+    ``manifest`` accepts a pre-read ``_read_prebuilt_manifest`` result so
+    callers that also want the manifest (e.g. for logging) parse it once.
     """
     local_arches = set(_detect_local_arches())
     if not local_arches:
@@ -320,7 +341,8 @@ def _prebuilt_is_compatible(path: Path) -> bool:
         )
         return True
 
-    manifest = _read_prebuilt_manifest(path)
+    if manifest is _MANIFEST_UNREAD:
+        manifest = _read_prebuilt_manifest(path)
     if manifest is None:
         logger.warning(
             "Skipping unverified TurboQuant prebuilt extension %s on CUDA arches %s; "
@@ -368,14 +390,15 @@ def _load_prebuilt_module():
     for candidate in _candidate_prebuilt_paths():
         if not candidate.is_file():
             continue
-        if not _prebuilt_is_compatible(candidate):
+        manifest = _read_prebuilt_manifest(candidate)
+        if not _prebuilt_is_compatible(candidate, manifest=manifest):
             continue
         try:
             module = _load_module_from_path(candidate)
             logger.warning(
                 "Loaded prebuilt TurboQuant CUDA extension from %s (manifest arches=%s)",
                 candidate,
-                sorted(_read_prebuilt_arches(candidate) or [], key=int),
+                sorted(manifest[0], key=int) if manifest else [],
             )
             return module
         except Exception as exc:

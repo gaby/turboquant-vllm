@@ -85,11 +85,14 @@ if LinearBase is not None:
             super().__init__()
             if bits not in (2, 3, 4):
                 raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
-            # The WHT rotation requires a power of two and the CUDA/Triton
-            # dequant kernels are compiled for exactly these sizes; anything
-            # else fails deep in the kernels with an obscure error.
-            if group_size not in (64, 128, 256):
-                raise ValueError(f"turboquant group_size must be 64, 128, or 256; got {group_size}")
+            # The WHT rotation requires a power of two — non-power-of-two
+            # multiples of 8 (e.g. 96) used to fail deep in the kernels with
+            # an obscure error. Sizes below 64 stay valid (tests and
+            # tiny-tensor checkpoints use 8) via the PyTorch path; the
+            # CUDA/Triton kernels enforce their own 64/128/256 support at
+            # dispatch time.
+            if group_size < 8 or group_size & (group_size - 1) != 0:
+                raise ValueError(f"turboquant group_size must be a power of two >= 8; got {group_size}")
             if sensitive_bits is not None and sensitive_bits not in (2, 3, 4):
                 raise ValueError(f"turboquant sensitive_bits must be 2, 3, or 4 or None; got {sensitive_bits}")
             self.bits = bits
@@ -294,9 +297,12 @@ if LinearBase is not None:
                 layer._tq_primary_fn = None
             # Without Triton, prefer the CUDA dequant-GEMM extension over the
             # last-resort per-forward Python unpack loop (same routing as
-            # TurboQuantWrapper._forward_gpu).
-            layer._tq_use_cuda_gemm = (
-                not _triton_available and cuda_mod is not None and _tq_cuda_dequant_gemm_fn is not None
+            # TurboQuantWrapper._forward_gpu). Bind the callable here so
+            # apply() doesn't run an import statement per forward.
+            layer._tq_cuda_gemm_fn = (
+                _tq_cuda_dequant_gemm_fn
+                if (not _triton_available and cuda_mod is not None and _tq_cuda_dequant_gemm_fn is not None)
+                else None
             )
 
             layer._already_called_process_weights_after_loading = True
@@ -361,10 +367,9 @@ if LinearBase is not None:
             # same routing as TurboQuantWrapper._forward_gpu. Availability is
             # decided once in process_weights_after_loading; the custom op is
             # opaque to dynamo like the Triton launchers.
-            if getattr(layer, "_tq_use_cuda_gemm", False) and x.is_cuda:
-                from turboquant_vllm.weight_quant import _tq_cuda_dequant_gemm_fn
-
-                return _tq_cuda_dequant_gemm_fn(
+            cuda_gemm_fn = getattr(layer, "_tq_cuda_gemm_fn", None)
+            if cuda_gemm_fn is not None and x.is_cuda:
+                return cuda_gemm_fn(
                     x,
                     layer.tq_packed_weight,
                     layer.tq_norms,
@@ -376,7 +381,11 @@ if LinearBase is not None:
                     self.bits,
                     layer.tq_out_features,
                     layer.tq_padded_in,  # x is already padded to this width
-                    self.group_size,  # block_size — online path is full-width WHT
+                    # block_size == group_size: the online method always
+                    # quantizes with a full-width WHT (no rotary_dim support,
+                    # unlike TurboQuantWrapper, which passes a rotary-aware
+                    # block size for partial-rotary layers).
+                    self.group_size,
                 )
 
             # Pure-PyTorch fallback (CPU, or CUDA without any extension)
@@ -410,9 +419,22 @@ else:
 # ── MoE online method ──
 
 
-def _positive_int(*values) -> "int | None":
-    """First value that is a positive plain int (bool excluded), else None."""
-    for value in values:
+def _materialize_target_device() -> str:
+    """Device that meta-initialized weights materialize onto."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# The expert weight tensors whose checkpoint-side arrival marks an online
+# MoE layer's load as complete. Biases and other auxiliary params shard
+# differently than the uniform tp scaling in _moe_expected_checkpoint_numel
+# assumes (e.g. w2_bias is replicated across TP), so they are buffered but
+# never counted toward the completion threshold.
+_TRACKED_MOE_WEIGHT_PARAMS = ("w13_weight", "w2_weight")
+
+
+def _positive_int(primary, fallback) -> "int | None":
+    """First of the two values that is a positive plain int (bool excluded)."""
+    for value in (primary, fallback):
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     return None
@@ -429,6 +451,10 @@ def _moe_expected_checkpoint_numel(layer, moe_config, partition_numel: int) -> "
     param numel therefore fires the materialize+compress trigger at ~1/tp of
     the load and compresses partially-loaded experts. Scale the partition-side
     sum by both factors instead.
+
+    ``partition_numel`` must cover only uniformly-TP-sharded expert weights
+    (see ``_TRACKED_MOE_WEIGHT_PARAMS``) — replicated params like ``w2_bias``
+    would inflate the expectation and make the threshold unreachable.
 
     Returns None when the parallel factors cannot be derived — the caller must
     then skip threshold-based triggering and let
@@ -453,16 +479,19 @@ def _moe_expected_checkpoint_numel(layer, moe_config, partition_numel: int) -> "
     return partition_numel * tp_size * (global_experts // local_experts)
 
 
-def _materialize_and_process(
-    layer,
-    buffer,
-    orig_loaders,
-    param_shapes,
-    param_dtypes,
-    method,
-):
-    """Materialize meta params on GPU, replay buffered loads, compress."""
-    target_device = "cuda" if torch.cuda.is_available() else "cpu"
+def _materialize_and_process(layer, state, method):
+    """Materialize meta params on GPU, replay buffered loads, compress.
+
+    ``state`` is the pending-load dict built in ``create_weights``
+    (buffer / orig_loaders / param_shapes / param_dtypes / materialized) —
+    the same object both completion paths (threshold fire and
+    ``_finish_online_moe_load``) operate on.
+    """
+    buffer = state["buffer"]
+    orig_loaders = state["orig_loaders"]
+    param_shapes = state["param_shapes"]
+    param_dtypes = state["param_dtypes"]
+    target_device = _materialize_target_device()
     # 1. Materialize meta → real tensors on GPU
     for name, param in list(layer.named_parameters(recurse=False)):
         if param.device == torch.device("meta") and name in param_shapes:
@@ -499,20 +528,37 @@ def _finish_online_moe_load(layer, method, pending_state) -> None:
     Covers layers where the checkpoint-side numel threshold never fired
     (unknown TP/EP factors, short checkpoints): replay the buffered loads
     and compress. Raises instead of compressing meta/unreplayed params —
-    a meta ``w13_weight`` here means the weights were simply never loaded
-    and compressing them would bake uninitialized data into the model.
+    ``_materialize_and_process`` allocates meta params via ``torch.empty``,
+    so any param with zero buffered loads would otherwise be compressed
+    from uninitialized memory with no error.
     """
     if pending_state is not None and not pending_state["materialized"][0]:
         pending_state["materialized"][0] = True
-        if pending_state["buffer"]:
-            _materialize_and_process(
-                layer,
-                pending_state["buffer"],
-                pending_state["orig_loaders"],
-                pending_state["param_shapes"],
-                pending_state["param_dtypes"],
-                method,
+        buffer = pending_state["buffer"]
+        if buffer:
+            # A non-empty buffer is not proof of completeness: every meta
+            # param that materialize would allocate must have at least one
+            # buffered load, or its torch.empty garbage gets compressed.
+            buffered_params = {pname for pname, _, _ in buffer}
+            unloaded = [
+                name
+                for name, param in layer.named_parameters(recurse=False)
+                if param.is_meta and name in pending_state["param_shapes"] and name not in buffered_params
+            ]
+            if unloaded:
+                raise RuntimeError(
+                    f"TurboQuant online MoE: checkpoint provided no weights for "
+                    f"{unloaded} on this layer ({len(buffer)} buffered loads for "
+                    f"{sorted(buffered_params)}). Refusing to compress "
+                    f"uninitialized parameters."
+                )
+            logger.warning(
+                "TurboQuant online MoE: load-completion threshold never fired for %s; "
+                "replaying %d buffered loads at process_weights_after_loading",
+                type(layer).__name__,
+                len(buffer),
             )
+            _materialize_and_process(layer, pending_state, method)
             return
 
     w13 = getattr(layer, "w13_weight", None)
@@ -578,7 +624,7 @@ def _materialize_meta_tensors(layer, label: str = ""):
     needed the rescue. Returns the list of materialized names for callers
     that want to assert on the result.
     """
-    target_device = "cuda" if torch.cuda.is_available() else "cpu"
+    target_device = _materialize_target_device()
     materialized: list[str] = []
     failed: list[str] = []
 
@@ -947,8 +993,13 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
         def create_weights(self, layer: nn.Module, **kwargs):
             self._unquant.create_weights(layer, **kwargs)
 
-            # Compute expected total numel for completion tracking
-            total_numel = sum(p.numel() for p in layer.parameters(recurse=False))
+            # Completion tracking counts only the uniformly-TP-sharded expert
+            # weights; biases (e.g. replicated w2_bias) would break the
+            # uniform scaling in _moe_expected_checkpoint_numel and leave the
+            # threshold unreachable.
+            tracked_numel = sum(
+                p.numel() for name, p in layer.named_parameters(recurse=False) if name in _TRACKED_MOE_WEIGHT_PARAMS
+            )
 
             # Save original weight_loaders + shapes BEFORE meta move
             orig_loaders: dict[str, Any] = {}
@@ -1060,7 +1111,9 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             # the threshold stays disabled and process_weights_after_loading
             # replays the buffer instead (correct, but holds this layer's
             # checkpoint shards in host memory until the load finishes).
-            expected_numel = _moe_expected_checkpoint_numel(layer, self._moe_config, total_numel)
+            expected_numel = (
+                _moe_expected_checkpoint_numel(layer, self._moe_config, tracked_numel) if tracked_numel > 0 else None
+            )
             if expected_numel is None:
                 logger.warning(
                     "TurboQuant online MoE: could not derive TP/EP factors for %s; "
@@ -1071,32 +1124,29 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             buffer: list[tuple[str, tuple, dict]] = []
             loaded_numel = [0]
             materialized = [False]
-            self._pending_load = {
+            pending_state = {
                 "buffer": buffer,
                 "orig_loaders": orig_loaders,
                 "param_shapes": param_shapes,
                 "param_dtypes": param_dtypes,
                 "materialized": materialized,
             }
+            self._pending_load = pending_state
 
             def _make_buffering_loader(param_name, orig_loader):
+                counted = param_name in _TRACKED_MOE_WEIGHT_PARAMS
+
                 def _buffering_loader(*args, **kwargs):
                     if materialized[0]:
                         return orig_loader(*args, **kwargs)
-                    loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
-                    numel = loaded_weight.numel() if isinstance(loaded_weight, torch.Tensor) else 0
                     buffer.append((param_name, args, kwargs))
-                    loaded_numel[0] += numel
+                    if counted:
+                        loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
+                        if isinstance(loaded_weight, torch.Tensor):
+                            loaded_numel[0] += loaded_weight.numel()
                     if expected_numel is not None and loaded_numel[0] >= expected_numel:
                         materialized[0] = True
-                        _materialize_and_process(
-                            layer,
-                            buffer,
-                            orig_loaders,
-                            param_shapes,
-                            param_dtypes,
-                            self,
-                        )
+                        _materialize_and_process(layer, pending_state, self)
                     # Signal success so model.load_weights commits the expert
                     return True
 

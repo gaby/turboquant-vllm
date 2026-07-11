@@ -7,6 +7,7 @@
 
 #include "tq_weight_gemv_bs1.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -59,6 +60,8 @@ __global__ void tq3_gemv_bs1_kernel(
     __nv_bfloat16*       __restrict__ out,
     int K, int OC, int n_groups)
 {
+// Keep this threshold in sync with the host-side capability TORCH_CHECK in
+// tq3_gemv_bs1() below — below it, the kernel silently writes nothing.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int oc  = blockIdx.x;
     const int tid = threadIdx.x;
@@ -107,26 +110,6 @@ __global__ void tq3_gemv_bs1_kernel(
 
 }  // anonymous namespace
 
-// The kernel body above is compiled out below sm_80 (bf16 + warp-shuffle
-// requirements), which would leave the output tensor uninitialized with no
-// error. Cache the per-device compute capability so the hot bs=1 decode
-// path pays the cudaDeviceGetAttribute query once per device, not per call.
-static int cc_major_for_device(int device) {
-    constexpr int MAX_DEVICES = 64;
-    static int s_cc_major[MAX_DEVICES] = {};
-    if (device < 0 || device >= MAX_DEVICES) {
-        int major = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-        return major;
-    }
-    if (s_cc_major[device] == 0) {
-        int major = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-        s_cc_major[device] = major;
-    }
-    return s_cc_major[device];
-}
-
 torch::Tensor tq3_gemv_bs1(
     torch::Tensor x_rot,
     torch::Tensor packed,
@@ -135,7 +118,11 @@ torch::Tensor tq3_gemv_bs1(
 {
     TORCH_CHECK(x_rot.is_cuda() && packed.is_cuda() && norms.is_cuda() && codebook.is_cuda(),
                 "all inputs must be CUDA");
-    TORCH_CHECK(cc_major_for_device(x_rot.device().index()) >= 8,
+    // The kernel body is compiled out below sm_80 (see the __CUDA_ARCH__
+    // gate in tq3_gemv_bs1_kernel — keep the two thresholds in sync), which
+    // would leave the output tensor uninitialized with no error. ATen caches
+    // cudaDeviceProp per device, so this is a cheap lookup on the hot path.
+    TORCH_CHECK(at::cuda::getDeviceProperties(x_rot.device().index())->major >= 8,
                 "tq3_gemv_bs1 requires compute capability sm_80+ (Ampere or newer); "
                 "this device would silently return uninitialized output");
     TORCH_CHECK(x_rot.dtype() == torch::kBFloat16, "x_rot must be bf16");

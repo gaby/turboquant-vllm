@@ -141,6 +141,29 @@ def test_finish_replays_buffered_loads_and_compresses():
     assert not buffer  # replayed loads are cleared
 
 
+def test_finish_raises_when_buffer_covers_only_some_params():
+    """A non-empty buffer must not bypass the completeness check: a meta
+    param with zero buffered loads would be torch.empty-materialized and
+    compressed from uninitialized memory."""
+    layer = _Layer()
+    layer.register_parameter(
+        "w13_weight",
+        nn.Parameter(torch.empty(2, 4, 8, device="meta"), requires_grad=False),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        nn.Parameter(torch.empty(2, 8, 4, device="meta"), requires_grad=False),
+    )
+    buffer = [("w2_weight", (layer.w2_weight, torch.randn(2, 8, 4)), {})]
+    state = _pending_state_for(layer, buffer)
+    method = _FakeMethod()
+
+    with pytest.raises(RuntimeError, match="w13_weight"):
+        _finish_online_moe_load(layer, method, state)
+
+    assert method.compressed == 0
+
+
 def test_finish_raises_on_meta_weights_with_nothing_to_replay():
     """Meta params report numel() > 0, so compressing without a replay would
     bake uninitialized data — this must be a loud error instead."""

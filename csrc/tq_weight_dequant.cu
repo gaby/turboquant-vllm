@@ -17,51 +17,38 @@
 #include <cuda_bf16.h>
 #include <type_traits>
 
-// Constant memory for codebook and sign vectors.
-// Cached across kernel launches — only re-uploaded when config changes.
+// Constant memory for codebook and sign vectors (per-device symbols).
 __constant__ float c_centroids[16];
 __constant__ float c_signs1[256];
 __constant__ float c_signs2[256];
 
-// Track the last-uploaded config to skip redundant cudaMemcpyToSymbol.
-// Keyed on (device, pointers, bits, group_size): __constant__ symbols are
-// per-device, so a bare-pointer cache would upload to only one device in a
-// single-process multi-GPU setup and silently reuse stale symbols on the
-// others; and two configs (e.g. bits=3 default + bits=4 sensitive layers)
-// must never be conflated even if the allocator hands their tensors the
-// same address. Residual caveat: a freed-then-reallocated tensor at the
-// same address, same device AND same (bits, group_size) would still
-// false-hit — acceptable because the quantizer tensors backing these
-// pointers are process-lifetime cached (weight_quant._quantizers).
-struct UploadKey {
-    int device = -1;
-    const float* centroids = nullptr;
-    const float* signs1 = nullptr;
-    const float* signs2 = nullptr;
-    int64_t bits = 0;
-    int64_t group_size = 0;
-
-    bool operator==(const UploadKey& other) const {
-        return device == other.device && centroids == other.centroids
-            && signs1 == other.signs1 && signs2 == other.signs2
-            && bits == other.bits && group_size == other.group_size;
-    }
-};
-static UploadKey s_last_upload;
-
-static inline void maybe_upload_constants(
+// Upload the constants before EVERY launch — deliberately uncached.
+//
+// A host-side "skip if same config as last time" cache is incompatible with
+// CUDA graphs: a skipped upload records no memcpy node during graph capture,
+// so a captured graph replays against whatever constants the previous
+// graph/eager launch left resident. With mixed per-layer configs (e.g.
+// routed_expert_bits=2 experts + bits=3 linears, or kurtosis_aware bit
+// selection) that silently dequantizes with the wrong codebook. Uploading
+// unconditionally makes every captured graph self-contained (~1KB of D2D
+// memcpy nodes per launch; replay cost is tens of ns, dwarfed by the kernel)
+// and keeps eager launches correct after any graph replay.
+//
+// Known limitation (pre-existing): the constant bank is a single per-device
+// resource with stream-ordered updates, so two DIFFERENT configs dequanting
+// concurrently on separate streams of one device can still interleave.
+// vLLM launches these kernels on one stream per rank; multi-stream
+// mixed-config use would need the constants passed as kernel arguments.
+static inline void upload_constants(
     const float* cptr, const float* s1ptr, const float* s2ptr,
-    int64_t bits, int64_t group_size, int device, cudaStream_t stream
+    int64_t bits, int64_t group_size, cudaStream_t stream
 ) {
-    const UploadKey key{device, cptr, s1ptr, s2ptr, bits, group_size};
-    if (key == s_last_upload) return;
     cudaMemcpyToSymbolAsync(c_centroids, cptr, (1 << bits) * sizeof(float),
                             0, cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyToSymbolAsync(c_signs1, s1ptr, group_size * sizeof(float),
                             0, cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyToSymbolAsync(c_signs2, s2ptr, group_size * sizeof(float),
                             0, cudaMemcpyDeviceToDevice, stream);
-    s_last_upload = key;
 }
 
 
@@ -221,11 +208,11 @@ void tq_weight_dequant(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
         packed_weight.device().index()).stream();
 
-    maybe_upload_constants(
+    upload_constants(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),
-        bits, group_size, packed_weight.device().index(), stream);
+        bits, group_size, stream);
 
     dim3 grid(out_dim, n_groups);
     dim3 block(group_size);
@@ -446,11 +433,11 @@ void tq_weight_dequant_sparse_3d(
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
         packed_weight.device().index()).stream();
-    maybe_upload_constants(
+    upload_constants(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),
-        bits, group_size, packed_weight.device().index(), stream);
+        bits, group_size, stream);
 
     dim3 grid((unsigned)n_active * (unsigned)out_dim, (unsigned)n_groups);
     dim3 block((unsigned)group_size);
