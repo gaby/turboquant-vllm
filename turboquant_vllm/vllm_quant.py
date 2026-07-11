@@ -213,14 +213,14 @@ if LinearBase is not None:
             if getattr(layer, "_already_called_process_weights_after_loading", False):
                 return
 
+            # Backend state (_triton_available, _tq_*_fn) is initialized
+            # lazily by _ensure_triton_backends/_get_cuda_module below, so it
+            # must be read through the module AFTER those calls — a
+            # `from ... import` here would capture the pre-initialization
+            # None values on the first layer processed.
+            from turboquant_vllm import weight_quant as wq
             from turboquant_vllm.weight_quant import (
-                _ensure_triton_backends,
-                _get_cuda_module,
                 _get_quantizer,
-                _tq_cuda_dequant_gemm_fn,
-                _tq_fused_gemm_fn,
-                _tq_fwht_input_fn,
-                _triton_available,
                 pack_indices,
                 padded_size,
             )
@@ -291,12 +291,12 @@ if LinearBase is not None:
             # Triton/CUDA kernels are built for exactly these group sizes;
             # anything else (e.g. group_size=8 test configs) must take the
             # pure-PyTorch path in apply() rather than crash at dispatch.
-            kernels_support_group = group_size in (64, 128, 256)
-            _ensure_triton_backends()
-            cuda_mod = _get_cuda_module()
-            if _triton_available and kernels_support_group:
-                layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
-                layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
+            kernels_support_group = group_size in wq._CUDA_KERNEL_GROUP_SIZES
+            triton_ok = wq._ensure_triton_backends()
+            cuda_mod = wq._get_cuda_module()
+            if triton_ok and kernels_support_group:
+                layer._tq_primary_fn = wq._tq_fwht_input_fn if out_dim >= 4096 else wq._tq_fused_gemm_fn
+                layer._tq_fallback_fn = wq._tq_fused_gemm_fn if out_dim >= 4096 else wq._tq_fwht_input_fn
             else:
                 layer._tq_primary_fn = None
             # Without Triton, prefer the CUDA dequant-GEMM extension over the
@@ -304,12 +304,12 @@ if LinearBase is not None:
             # TurboQuantWrapper._forward_gpu). Bind the callable here so
             # apply() doesn't run an import statement per forward.
             layer._tq_cuda_gemm_fn = (
-                _tq_cuda_dequant_gemm_fn
+                wq._tq_cuda_dequant_gemm_fn
                 if (
                     layer._tq_primary_fn is None
                     and kernels_support_group
                     and cuda_mod is not None
-                    and _tq_cuda_dequant_gemm_fn is not None
+                    and wq._tq_cuda_dequant_gemm_fn is not None
                 )
                 else None
             )
@@ -1162,11 +1162,12 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                         # expert weight). vLLM's caller may still hold the
                         # pre-materialization meta param (params_dict is
                         # built once per load pass), so route the write into
-                        # the live registered param.
-                        if len(args) > 1:
-                            current = getattr(layer, param_name, None)
-                            if current is not None:
-                                return orig_loader(current, *args[1:], **kwargs)
+                        # the live registered param. args[0] is the param in
+                        # every call shape; loaded_weight may be positional
+                        # or a kwarg.
+                        current = getattr(layer, param_name, None)
+                        if current is not None and args:
+                            return orig_loader(current, *args[1:], **kwargs)
                         return orig_loader(*args, **kwargs)
                     buffer.append((param_name, args, kwargs))
                     if counted:

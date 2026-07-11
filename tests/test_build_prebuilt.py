@@ -106,10 +106,20 @@ def test_gencode_override_accepts_named_and_suffixed_arches(monkeypatch, no_arch
     monkeypatch.setattr(tq_build, "_cuda_version_tuple", lambda: (12, 9))
     monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
 
-    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "Hopper+PTX")
+    # Named arches imply '+PTX' on their highest target, matching PyTorch's
+    # own expansions (Hopper == '9.0+PTX', Ampere == '8.0;8.6+PTX').
+    for token in ("Hopper", "Hopper+PTX"):
+        monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", token)
+        assert tq_build._gencode_flags() == [
+            "-gencode=arch=compute_90,code=sm_90",
+            "-gencode=arch=compute_90,code=compute_90",
+        ]
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "Ampere")
     assert tq_build._gencode_flags() == [
-        "-gencode=arch=compute_90,code=sm_90",
-        "-gencode=arch=compute_90,code=compute_90",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_86,code=compute_86",
     ]
 
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0a 12.0f")

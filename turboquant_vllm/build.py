@@ -113,7 +113,9 @@ _CUDA13_MIN_ARCH = 75
 
 # Named architectures accepted by PyTorch's TORCH_CUDA_ARCH_LIST (see
 # torch.utils.cpp_extension._get_cuda_arch_flags) mapped to the SM targets
-# they expand to for discrete GPUs.
+# they expand to for discrete GPUs. PyTorch's named expansions always carry
+# an implicit '+PTX' on their highest target (e.g. Ampere -> '8.0;8.6+PTX'),
+# which the parser below mirrors.
 _NAMED_ARCH_TOKENS: dict[str, tuple[int, ...]] = {
     "TURING": (75,),
     "AMPERE": (80, 86),
@@ -177,22 +179,26 @@ def _gencode_flags() -> list[str]:
             named = _NAMED_ARCH_TOKENS.get(token.upper())
             if named is not None:
                 arch_nums = list(named)
+                # Mirror PyTorch: named arches imply PTX on their highest
+                # SM target ('Hopper' == '9.0+PTX').
+                wants_ptx = True
             else:
                 match = _ARCH_TOKEN_RE.match(token.replace(".", "").upper())
                 if match is None:
                     logger.warning("Ignoring unrecognized CUDA arch token %r in arch-list override", token)
                     continue
                 arch_nums = [int(match.group(1))]
+            supported = [a for a in arch_nums if _arch_supported_by_cuda(a, cuda_version)]
             for arch_num in arch_nums:
-                if not _arch_supported_by_cuda(arch_num, cuda_version):
+                if arch_num not in supported:
                     logger.warning(
                         "Skipping requested CUDA arch sm_%d: not compilable by CUDA %d.%d",
                         arch_num,
                         *cuda_version,
                     )
-                    continue
+            for arch_num in supported:
                 flags.append(_sass_flag(arch_num))
-                if wants_ptx:
+                if wants_ptx and arch_num == max(supported):
                     flags.append(_ptx_flag(arch_num))
         if flags:
             return flags

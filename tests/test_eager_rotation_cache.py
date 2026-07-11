@@ -25,15 +25,32 @@ import torch.nn as nn
 
 
 class TestEagerRotationMatrixCache(unittest.TestCase):
-    """Constructing a TurboQuantWrapper must populate the cache."""
+    """Constructing a TurboQuantWrapper must populate the cache.
+
+    The eager population only runs when the Triton path is active (it exists
+    to warm the cache the Triton kernels read), so these tests simulate
+    Triton availability; ``_ensure_triton_backends`` correctly reports False
+    on a Triton-less box and skips the population entirely (covered by
+    ``TestEagerCacheSurvivesWithoutTriton`` below).
+    """
 
     def setUp(self):
         # Clear the cache at the start of each test so hits/misses are
         # deterministic regardless of test order.
+        from turboquant_vllm import weight_quant
         from turboquant_vllm.triton_ops import _rotation_matrix_cache
 
         _rotation_matrix_cache.clear()
         self._cache = _rotation_matrix_cache
+        # Simulate "Triton probe returned True" (the cache is Triton-only).
+        self._saved_triton = weight_quant._triton_available
+        weight_quant._triton_available = True
+
+    def tearDown(self):
+        from turboquant_vllm import weight_quant
+
+        weight_quant._triton_available = self._saved_triton
+        self._cache.clear()
 
     def _build_wrapper(self, in_features=256, out_features=128, bits=3, group_size=128):
         from turboquant_vllm.weight_quant import TurboQuantWrapper
