@@ -754,10 +754,10 @@ try:
         group_size: int,
         bits: int,
     ) -> torch.Tensor:
-        if x.dim() == 2 and x.shape[0] == 1 and bits == 3:
-            from turboquant_vllm.weight_quant import _get_cuda_module
+        from turboquant_vllm import weight_quant as wq
 
-            cuda_mod = _get_cuda_module()
+        if x.dim() == 2 and x.shape[0] == 1 and bits == 3:
+            cuda_mod = wq._get_cuda_module()
             gemv = getattr(cuda_mod, "tq3_gemv_bs1", None) if cuda_mod else None
             if gemv is not None:
                 x_rot = rotate_input(
@@ -768,17 +768,38 @@ try:
                 ).to(torch.bfloat16)
                 out = gemv(x_rot.view(-1), packed_bs1, norms_bf16, centroids_bf16)
                 return out.view(1, -1)
-        return _tq_fwht_input_gemm_impl(
-            x,
-            packed_weight,
-            norms,
-            signs1,
-            signs2,
-            centroids,
-            group_size=group_size,
-            bits=bits,
-            bias=None,
-        )
+        if wq._ensure_triton_backends():
+            return _tq_fwht_input_gemm_impl(
+                x,
+                packed_weight,
+                norms,
+                signs1,
+                signs2,
+                centroids,
+                group_size=group_size,
+                bits=bits,
+                bias=None,
+            )
+        # Triton-less host: the CUDA GEMV above only covers M == 1, so route
+        # M > 1 (prefill) through the CUDA dequant-GEMM op — the raw Triton
+        # impl would raise ImportError here. Registration of the bs=1
+        # buffers guarantees one of the two backends exists.
+        if wq._get_cuda_module() is not None and wq._tq_cuda_dequant_gemm_fn is not None:
+            return wq._tq_cuda_dequant_gemm_fn(
+                x,
+                packed_weight,
+                norms,
+                signs1,
+                signs2,
+                centroids,
+                None,  # bias — tq3_apply is only routed for bias-free layers
+                group_size,
+                bits,
+                norms.shape[0],  # out_features
+                x.shape[-1],  # in_features (apply() pre-pads x to padded_in)
+                group_size,  # block_size — online path is full-width WHT
+            )
+        raise RuntimeError("tq3_apply requires Triton or the TurboQuant CUDA extension for batch sizes > 1")
 
     @_tq3_apply_op.register_fake
     def _(x, packed_weight, norms, signs1, signs2, centroids, packed_bs1, norms_bf16, centroids_bf16, group_size, bits):

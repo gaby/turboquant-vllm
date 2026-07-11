@@ -260,11 +260,24 @@ if LinearBase is not None:
             layer.register_buffer("tq_signs1", quantizer.signs1)
             layer.register_buffer("tq_signs2", quantizer.signs2)
             layer.register_buffer("tq_centroids", quantizer.centroids)
+
+            # Backend probes + dispatch inputs — must run before CUDA graph
+            # capture. The Triton/CUDA kernels are built for exactly these
+            # group sizes; anything else (e.g. group_size=8 test configs)
+            # must take the pure-PyTorch path in apply() rather than crash
+            # at dispatch.
+            kernels_support_group = group_size in wq._CUDA_KERNEL_GROUP_SIZES
+            triton_ok = wq._ensure_triton_backends()
+            cuda_mod = wq._get_cuda_module()
+
             # Pre-cast bf16 companions consumed by the bs=1 CUDA GEMV fast path.
             # Casting once at load time avoids per-decode-step HBM traffic.
             # Gate registration on the arch requirement so apply()'s fast-path
             # check collapses to a single hasattr() rather than a per-call
-            # cudaGetDeviceProperties query.
+            # cudaGetDeviceProperties query. Also require at least one M>1
+            # backend (Triton or the CUDA extension): the tq3_apply route
+            # this registration enables covers only M == 1 with the GEMV and
+            # needs one of them for prefill.
             # weight may sit on CPU (offload paths) — get_device_capability
             # raises on non-CUDA devices even when CUDA is available.
             arch_ok = (
@@ -272,7 +285,7 @@ if LinearBase is not None:
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability(weight.device)[0] >= 8
             )
-            if bits == 3 and group_size == 128 and arch_ok:
+            if bits == 3 and group_size == 128 and arch_ok and (triton_ok or cuda_mod is not None):
                 bytes_per_group = group_size * bits // 8
                 layer.register_buffer(
                     "tq_packed_bs1",
@@ -287,13 +300,6 @@ if LinearBase is not None:
             layer.tq_out_features = out_dim
             layer.tq_padded_in = padded_in
 
-            # Cache dispatch — must run before CUDA graph capture. The
-            # Triton/CUDA kernels are built for exactly these group sizes;
-            # anything else (e.g. group_size=8 test configs) must take the
-            # pure-PyTorch path in apply() rather than crash at dispatch.
-            kernels_support_group = group_size in wq._CUDA_KERNEL_GROUP_SIZES
-            triton_ok = wq._ensure_triton_backends()
-            cuda_mod = wq._get_cuda_module()
             if triton_ok and kernels_support_group:
                 layer._tq_primary_fn = wq._tq_fwht_input_fn if out_dim >= 4096 else wq._tq_fused_gemm_fn
                 layer._tq_fallback_fn = wq._tq_fused_gemm_fn if out_dim >= 4096 else wq._tq_fwht_input_fn
