@@ -12,6 +12,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <type_traits>
@@ -22,30 +23,45 @@ __constant__ float c_centroids[16];
 __constant__ float c_signs1[256];
 __constant__ float c_signs2[256];
 
-// Track last-uploaded config to skip redundant cudaMemcpyToSymbol
-static const float* s_last_centroids = nullptr;
-static const float* s_last_signs1 = nullptr;
-static const float* s_last_signs2 = nullptr;
+// Track the last-uploaded config to skip redundant cudaMemcpyToSymbol.
+// Keyed on (device, pointers, bits, group_size): __constant__ symbols are
+// per-device, so a bare-pointer cache would upload to only one device in a
+// single-process multi-GPU setup and silently reuse stale symbols on the
+// others; and two configs (e.g. bits=3 default + bits=4 sensitive layers)
+// must never be conflated even if the allocator hands their tensors the
+// same address. Residual caveat: a freed-then-reallocated tensor at the
+// same address, same device AND same (bits, group_size) would still
+// false-hit — acceptable because the quantizer tensors backing these
+// pointers are process-lifetime cached (weight_quant._quantizers).
+struct UploadKey {
+    int device = -1;
+    const float* centroids = nullptr;
+    const float* signs1 = nullptr;
+    const float* signs2 = nullptr;
+    int64_t bits = 0;
+    int64_t group_size = 0;
+
+    bool operator==(const UploadKey& other) const {
+        return device == other.device && centroids == other.centroids
+            && signs1 == other.signs1 && signs2 == other.signs2
+            && bits == other.bits && group_size == other.group_size;
+    }
+};
+static UploadKey s_last_upload;
 
 static inline void maybe_upload_constants(
     const float* cptr, const float* s1ptr, const float* s2ptr,
-    int64_t bits, int64_t group_size, cudaStream_t stream
+    int64_t bits, int64_t group_size, int device, cudaStream_t stream
 ) {
-    if (cptr != s_last_centroids) {
-        cudaMemcpyToSymbolAsync(c_centroids, cptr, (1 << bits) * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_centroids = cptr;
-    }
-    if (s1ptr != s_last_signs1) {
-        cudaMemcpyToSymbolAsync(c_signs1, s1ptr, group_size * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_signs1 = s1ptr;
-    }
-    if (s2ptr != s_last_signs2) {
-        cudaMemcpyToSymbolAsync(c_signs2, s2ptr, group_size * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_signs2 = s2ptr;
-    }
+    const UploadKey key{device, cptr, s1ptr, s2ptr, bits, group_size};
+    if (key == s_last_upload) return;
+    cudaMemcpyToSymbolAsync(c_centroids, cptr, (1 << bits) * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyToSymbolAsync(c_signs1, s1ptr, group_size * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyToSymbolAsync(c_signs2, s2ptr, group_size * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
+    s_last_upload = key;
 }
 
 
@@ -196,6 +212,10 @@ void tq_weight_dequant(
     int n_groups = (in_dim + group_size - 1) / group_size;
     int packed_group_bytes = packed_group_bytes_for(bits, group_size);
 
+    // Make the tensor's device current: the __constant__ upload and the
+    // kernel launch below both target the active device context.
+    const c10::cuda::OptionalCUDAGuard device_guard(packed_weight.device());
+
     // PyTorch's current CUDA stream so launches are captured by CUDA graphs
     // (vLLM piecewise capture, torch.compile reduce-overhead).
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
@@ -205,7 +225,7 @@ void tq_weight_dequant(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),
-        bits, group_size, stream);
+        bits, group_size, packed_weight.device().index(), stream);
 
     dim3 grid(out_dim, n_groups);
     dim3 block(group_size);
@@ -422,13 +442,15 @@ void tq_weight_dequant_sparse_3d(
     const int n_groups = ((int)in_dim + (int)group_size - 1) / (int)group_size;
     const int packed_group_bytes = packed_group_bytes_for(bits, group_size);
 
+    const c10::cuda::OptionalCUDAGuard device_guard(packed_weight.device());
+
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
         packed_weight.device().index()).stream();
     maybe_upload_constants(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),
-        bits, group_size, stream);
+        bits, group_size, packed_weight.device().index(), stream);
 
     dim3 grid((unsigned)n_active * (unsigned)out_dim, (unsigned)n_groups);
     dim3 block((unsigned)group_size);
