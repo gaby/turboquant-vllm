@@ -36,6 +36,11 @@ _tq_fused_gemm_fn = None
 _tq_fwht_input_fn = None
 _tq_cuda_dequant_gemm_fn = None
 
+# Group sizes the CUDA and Triton kernels are compiled/validated for. Other
+# power-of-two sizes (e.g. 8 in tests and tiny-tensor checkpoints) are legal
+# but must route through the pure-PyTorch paths.
+_CUDA_KERNEL_GROUP_SIZES = (64, 128, 256)
+
 
 def _ensure_triton_backends() -> bool:
     """Lazy-load Triton kernel functions on first use.
@@ -47,13 +52,21 @@ def _ensure_triton_backends() -> bool:
     function with "Skip calling `torch.compiler.disable()`d function".
 
     Returns True if both Triton kernels loaded; False otherwise.
+
+    NOTE: importing ``tq_fused_gemm``/``tq_fwht_input_gemm`` succeeding is
+    NOT proof Triton exists — ``triton_ops`` defines those wrappers even
+    without Triton installed (they raise ImportError when *called*). Gate on
+    ``triton_ops.HAS_TRITON``, or a Triton-less GPU host would bind kernels
+    that crash at the first forward instead of using the CUDA/PyTorch paths.
     """
     global _triton_available, _tq_fused_gemm_fn, _tq_fwht_input_fn
     if _triton_available is not None:
         return _triton_available
     try:
-        from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
+        from turboquant_vllm.triton_ops import HAS_TRITON, tq_fused_gemm, tq_fwht_input_gemm
 
+        if not HAS_TRITON:
+            raise ImportError("triton is not installed")
         _tq_fused_gemm_fn = tq_fused_gemm
         _tq_fwht_input_fn = tq_fwht_input_gemm
         _triton_available = True
@@ -618,7 +631,12 @@ class TurboQuantWrapper(nn.Module):
         helpers, or method calls on non-tensor Python objects that do dict
         lookups / string conversions. vLLM 0.19 AOT-compiles this path.
         """
-        if _triton_available and x.is_cuda and self._can_use_full_wht_kernels():
+        if (
+            _triton_available
+            and x.is_cuda
+            and self._can_use_full_wht_kernels()
+            and self.group_size in _CUDA_KERNEL_GROUP_SIZES
+        ):
             # Pad input if in_features was not a multiple of group_size
             if x.shape[-1] != self.padded_in:
                 x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
@@ -638,7 +656,11 @@ class TurboQuantWrapper(nn.Module):
         # CUDA C++ extension path — handles both full-width and block-diagonal
         # WHT via the block_size parameter, so partial-rotary q/k_proj layers
         # use this path instead of falling through to _forward_cpu.
-        if _cuda_mod is not None and _tq_cuda_dequant_gemm_fn is not None:
+        if (
+            _cuda_mod is not None
+            and _tq_cuda_dequant_gemm_fn is not None
+            and self.group_size in _CUDA_KERNEL_GROUP_SIZES
+        ):
             block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
             return _tq_cuda_dequant_gemm_fn(
                 x,
@@ -755,7 +777,11 @@ class Compressed3D:
 
         grouped = padded.reshape(-1, group_size)
         quantizer = _get_quantizer(group_size, bits, str(data.device))
-        indices, norms = quantizer.quantize(grouped)
+        # norm_correction matches the Linear path (TurboQuantWrapper,
+        # TurboQuantOnlineLinearMethod) and the checkpoint exporter — without
+        # it, online-quantized MoE experts get systematically worse
+        # reconstruction than every other tensor in the model.
+        indices, norms = quantizer.quantize(grouped, norm_correction=True)
 
         self.packed = pack_indices(indices, bits)
         self.norms = norms.reshape(n_experts * out_dim, self.n_groups)
@@ -836,7 +862,7 @@ class Compressed3D:
         )
 
         cuda_mod = _get_cuda_module()
-        if cuda_mod is None or not self.packed.is_cuda:
+        if cuda_mod is None or not self.packed.is_cuda or self.group_size not in _CUDA_KERNEL_GROUP_SIZES:
             out.copy_(self.decompress())
             return
 
@@ -879,7 +905,7 @@ class Compressed3D:
         assert out.device == self.packed.device
 
         cuda_mod = _get_cuda_module()
-        if cuda_mod is None or not self.packed.is_cuda:
+        if cuda_mod is None or not self.packed.is_cuda or self.group_size not in _CUDA_KERNEL_GROUP_SIZES:
             out.copy_(self.decompress())
             return
 
@@ -954,7 +980,7 @@ class Compressed3D:
         cuda_mod = _get_cuda_module()
         n_experts, out_dim, in_dim = self.shape
 
-        if cuda_mod is not None and self.packed.is_cuda:
+        if cuda_mod is not None and self.packed.is_cuda and self.group_size in _CUDA_KERNEL_GROUP_SIZES:
             if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == self.dtype:
                 output = buf
             else:

@@ -2,12 +2,17 @@
 
 Reproduces the bug where MoE GPU memory stays at 5 GB instead of growing
 to expected ~62 GB — the replay doesn't actually fill the materialized params.
+
+Uses the REAL ``_materialize_and_process`` from ``vllm_quant`` (not an inline
+reimplementation) so regressions in the shipped completion logic fail here.
 """
 
 import unittest
 
 import torch
 import torch.nn as nn
+
+from turboquant_vllm.vllm_quant import _materialize_and_process
 
 
 class FakeFusedMoE(nn.Module):
@@ -25,8 +30,6 @@ class FakeFusedMoE(nn.Module):
         self.w2_weight.weight_loader = self._make_loader("w2_weight")
 
     def _make_loader(self, param_name: str):
-        layer = self
-
         def weight_loader(param, loaded_weight, expert_id=0, shard_id="gate"):
             """Simulate FusedMoE expert assembly."""
             if param_name == "w13_weight":
@@ -41,13 +44,21 @@ class FakeFusedMoE(nn.Module):
         return weight_loader
 
 
+class _RecordingMethod:
+    def __init__(self):
+        self.compressed = 0
+
+    def _do_compress(self, layer):
+        self.compressed += 1
+
+
 class TestMoEReplay(unittest.TestCase):
     def test_full_flow_buffer_materialize_replay(self):
         """Simulate the complete flow: create → meta → buffer → materialize → replay."""
         num_experts, out_dim, in_dim = 4, 8, 16
         layer = FakeFusedMoE(num_experts, out_dim, in_dim)
 
-        # Save original state
+        # Save original state (mirrors create_weights)
         orig_loaders = {}
         param_shapes = {}
         param_dtypes = {}
@@ -56,8 +67,6 @@ class TestMoEReplay(unittest.TestCase):
                 orig_loaders[name] = param.weight_loader
             param_shapes[name] = tuple(param.shape)
             param_dtypes[name] = param.dtype
-
-        total_numel = sum(p.numel() for p in layer.parameters())
 
         # Move to meta
         for name, param in list(layer.named_parameters(recurse=False)):
@@ -70,73 +79,36 @@ class TestMoEReplay(unittest.TestCase):
         for name, param in layer.named_parameters(recurse=False):
             self.assertEqual(param.device, torch.device("meta"))
 
-        # Set up buffering (same as create_weights)
+        # Buffer loader calls exactly as the buffering loader records them:
+        # (param_name, full args tuple, kwargs)
         buffer = []
-        loaded_numel = [0]
-        materialized = [False]
-
-        def make_buffering_loader(pname, orig):
-            def _buf(*args, **kwargs):
-                if materialized[0]:
-                    return orig(*args, **kwargs)
-                loaded = args[1] if len(args) > 1 else None
-                numel = loaded.numel() if isinstance(loaded, torch.Tensor) else 0
-                buffer.append((pname, args, kwargs))
-                loaded_numel[0] += numel
-
-            return _buf
-
-        for name, param in layer.named_parameters(recurse=False):
-            if name in orig_loaders:
-                param.weight_loader = make_buffering_loader(name, orig_loaders[name])
-
-        # Simulate model.load_weights calling param.weight_loader
         expert_data = {}
         for expert_id in range(num_experts):
             gate = torch.randn(out_dim, in_dim)
             up = torch.randn(out_dim, in_dim)
             down = torch.randn(in_dim, out_dim)
             expert_data[expert_id] = (gate, up, down)
+            buffer.append(("w13_weight", (layer.w13_weight, gate), {"expert_id": expert_id, "shard_id": "gate"}))
+            buffer.append(("w13_weight", (layer.w13_weight, up), {"expert_id": expert_id, "shard_id": "up"}))
+            buffer.append(("w2_weight", (layer.w2_weight, down), {"expert_id": expert_id}))
 
-            # These calls go through _buffering_loader
-            layer.w13_weight.weight_loader(layer.w13_weight, gate, expert_id=expert_id, shard_id="gate")
-            layer.w13_weight.weight_loader(layer.w13_weight, up, expert_id=expert_id, shard_id="up")
-            layer.w2_weight.weight_loader(layer.w2_weight, down, expert_id=expert_id)
+        state = {
+            "buffer": buffer,
+            "orig_loaders": orig_loaders,
+            "param_shapes": param_shapes,
+            "param_dtypes": param_dtypes,
+            "materialized": [True],
+        }
+        method = _RecordingMethod()
 
-        self.assertEqual(loaded_numel[0], total_numel)
-        self.assertEqual(len(buffer), 12)
+        _materialize_and_process(layer, state, method)
 
-        # Now simulate _materialize_and_process
-        # 1. Materialize
-        for name, param in list(layer.named_parameters(recurse=False)):
-            if param.device == torch.device("meta") and name in param_shapes:
-                real = nn.Parameter(
-                    torch.zeros(param_shapes[name], dtype=param_dtypes[name]),
-                    requires_grad=False,
-                )
-                if name in orig_loaders:
-                    real.weight_loader = orig_loaders[name]
-                delattr(layer, name)
-                layer.register_parameter(name, real)
+        self.assertEqual(method.compressed, 1)
+        self.assertEqual(len(buffer), 0)  # replayed loads are cleared
 
-        # Verify materialized params are on CPU (no CUDA in test), zeroed
-        for name, param in layer.named_parameters(recurse=False):
-            self.assertNotEqual(param.device, torch.device("meta"))
-            self.assertEqual(param.sum().item(), 0.0)
-
-        # 2. Replay
-        for pname, args, kwargs in buffer:
-            loader = orig_loaders.get(pname)
-            if loader is not None:
-                param = getattr(layer, pname)
-                new_args = (param,) + args[1:]
-                loader(*new_args, **kwargs)
-        buffer.clear()
-
-        # 3. Verify data is loaded
+        # Verify materialized params are real (CPU here) and filled
         for expert_id in range(num_experts):
             gate, up, down = expert_data[expert_id]
-            # Check w13_weight[expert_id] has gate + up data
             w13 = layer.w13_weight.data[expert_id]
             self.assertTrue(
                 torch.allclose(w13[:out_dim], gate),
@@ -146,11 +118,47 @@ class TestMoEReplay(unittest.TestCase):
                 torch.allclose(w13[out_dim:], up),
                 f"Expert {expert_id} up data mismatch",
             )
-            # Check w2_weight[expert_id] has down data
             self.assertTrue(
                 torch.allclose(layer.w2_weight.data[expert_id], down),
                 f"Expert {expert_id} down data mismatch",
             )
+
+    def test_materialize_zero_fills_params_with_no_buffered_load(self):
+        """A loader-less (or late-loading) param must come out as zeros, not
+        uninitialized memory — _do_compress reads it before any late load."""
+        layer = FakeFusedMoE(num_experts=2, out_dim=4, in_dim=8)
+        bias = nn.Parameter(torch.full((2, 8), 7.0), requires_grad=False)
+        layer.register_parameter("w2_bias", bias)  # no weight_loader
+
+        orig_loaders = {}
+        param_shapes = {}
+        param_dtypes = {}
+        for name, param in layer.named_parameters(recurse=False):
+            if hasattr(param, "weight_loader"):
+                orig_loaders[name] = param.weight_loader
+            param_shapes[name] = tuple(param.shape)
+            param_dtypes[name] = param.dtype
+
+        for name, param in list(layer.named_parameters(recurse=False)):
+            meta = nn.Parameter(torch.empty_like(param, device="meta"), requires_grad=False)
+            if hasattr(param, "weight_loader"):
+                meta.weight_loader = param.weight_loader
+            delattr(layer, name)
+            layer.register_parameter(name, meta)
+
+        w13_load = torch.randn(4, 8)
+        state = {
+            "buffer": [("w13_weight", (layer.w13_weight, w13_load), {"expert_id": 0, "shard_id": "gate"})],
+            "orig_loaders": orig_loaders,
+            "param_shapes": param_shapes,
+            "param_dtypes": param_dtypes,
+            "materialized": [True],
+        }
+
+        _materialize_and_process(layer, state, _RecordingMethod())
+
+        self.assertFalse(layer.w2_bias.is_meta)
+        self.assertEqual(layer.w2_bias.data.abs().sum().item(), 0.0)
 
     def test_replay_with_wrong_param_reference(self):
         """If replay uses stale param reference, data won't land."""

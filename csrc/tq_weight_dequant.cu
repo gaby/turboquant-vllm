@@ -12,40 +12,43 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <type_traits>
 
-// Constant memory for codebook and sign vectors.
-// Cached across kernel launches — only re-uploaded when config changes.
+// Constant memory for codebook and sign vectors (per-device symbols).
 __constant__ float c_centroids[16];
 __constant__ float c_signs1[256];
 __constant__ float c_signs2[256];
 
-// Track last-uploaded config to skip redundant cudaMemcpyToSymbol
-static const float* s_last_centroids = nullptr;
-static const float* s_last_signs1 = nullptr;
-static const float* s_last_signs2 = nullptr;
-
-static inline void maybe_upload_constants(
+// Upload the constants before EVERY launch — deliberately uncached.
+//
+// A host-side "skip if same config as last time" cache is incompatible with
+// CUDA graphs: a skipped upload records no memcpy node during graph capture,
+// so a captured graph replays against whatever constants the previous
+// graph/eager launch left resident. With mixed per-layer configs (e.g.
+// routed_expert_bits=2 experts + bits=3 linears, or kurtosis_aware bit
+// selection) that silently dequantizes with the wrong codebook. Uploading
+// unconditionally makes every captured graph self-contained (~1KB of D2D
+// memcpy nodes per launch; replay cost is tens of ns, dwarfed by the kernel)
+// and keeps eager launches correct after any graph replay.
+//
+// Known limitation (pre-existing): the constant bank is a single per-device
+// resource with stream-ordered updates, so two DIFFERENT configs dequanting
+// concurrently on separate streams of one device can still interleave.
+// vLLM launches these kernels on one stream per rank; multi-stream
+// mixed-config use would need the constants passed as kernel arguments.
+static inline void upload_constants(
     const float* cptr, const float* s1ptr, const float* s2ptr,
     int64_t bits, int64_t group_size, cudaStream_t stream
 ) {
-    if (cptr != s_last_centroids) {
-        cudaMemcpyToSymbolAsync(c_centroids, cptr, (1 << bits) * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_centroids = cptr;
-    }
-    if (s1ptr != s_last_signs1) {
-        cudaMemcpyToSymbolAsync(c_signs1, s1ptr, group_size * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_signs1 = s1ptr;
-    }
-    if (s2ptr != s_last_signs2) {
-        cudaMemcpyToSymbolAsync(c_signs2, s2ptr, group_size * sizeof(float),
-                                0, cudaMemcpyDeviceToDevice, stream);
-        s_last_signs2 = s2ptr;
-    }
+    cudaMemcpyToSymbolAsync(c_centroids, cptr, (1 << bits) * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyToSymbolAsync(c_signs1, s1ptr, group_size * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyToSymbolAsync(c_signs2, s2ptr, group_size * sizeof(float),
+                            0, cudaMemcpyDeviceToDevice, stream);
 }
 
 
@@ -196,12 +199,16 @@ void tq_weight_dequant(
     int n_groups = (in_dim + group_size - 1) / group_size;
     int packed_group_bytes = packed_group_bytes_for(bits, group_size);
 
+    // Make the tensor's device current: the __constant__ upload and the
+    // kernel launch below both target the active device context.
+    const c10::cuda::OptionalCUDAGuard device_guard(packed_weight.device());
+
     // PyTorch's current CUDA stream so launches are captured by CUDA graphs
     // (vLLM piecewise capture, torch.compile reduce-overhead).
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
         packed_weight.device().index()).stream();
 
-    maybe_upload_constants(
+    upload_constants(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),
@@ -422,9 +429,11 @@ void tq_weight_dequant_sparse_3d(
     const int n_groups = ((int)in_dim + (int)group_size - 1) / (int)group_size;
     const int packed_group_bytes = packed_group_bytes_for(bits, group_size);
 
+    const c10::cuda::OptionalCUDAGuard device_guard(packed_weight.device());
+
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
         packed_weight.device().index()).stream();
-    maybe_upload_constants(
+    upload_constants(
         centroids.data_ptr<float>(),
         signs1.data_ptr<float>(),
         signs2.data_ptr<float>(),

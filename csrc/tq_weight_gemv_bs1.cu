@@ -7,7 +7,9 @@
 
 #include "tq_weight_gemv_bs1.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -58,6 +60,8 @@ __global__ void tq3_gemv_bs1_kernel(
     __nv_bfloat16*       __restrict__ out,
     int K, int OC, int n_groups)
 {
+// Keep this threshold in sync with the host-side capability TORCH_CHECK in
+// tq3_gemv_bs1() below — below it, the kernel silently writes nothing.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int oc  = blockIdx.x;
     const int tid = threadIdx.x;
@@ -114,6 +118,13 @@ torch::Tensor tq3_gemv_bs1(
 {
     TORCH_CHECK(x_rot.is_cuda() && packed.is_cuda() && norms.is_cuda() && codebook.is_cuda(),
                 "all inputs must be CUDA");
+    // The kernel body is compiled out below sm_80 (see the __CUDA_ARCH__
+    // gate in tq3_gemv_bs1_kernel — keep the two thresholds in sync), which
+    // would leave the output tensor uninitialized with no error. ATen caches
+    // cudaDeviceProp per device, so this is a cheap lookup on the hot path.
+    TORCH_CHECK(at::cuda::getDeviceProperties(x_rot.device().index())->major >= 8,
+                "tq3_gemv_bs1 requires compute capability sm_80+ (Ampere or newer); "
+                "this device would silently return uninitialized output");
     TORCH_CHECK(x_rot.dtype() == torch::kBFloat16, "x_rot must be bf16");
     TORCH_CHECK(packed.dtype() == torch::kUInt8, "packed must be uint8");
     TORCH_CHECK(norms.dtype() == torch::kBFloat16, "norms must be bf16");
@@ -129,6 +140,8 @@ torch::Tensor tq3_gemv_bs1(
     TORCH_CHECK(packed.dim() == 2 && packed.size(0) == OC * n_groups
                 && packed.size(1) == BYTES_PER_GROUP,
                 "packed shape must be (OC * n_groups, 48)");
+
+    const c10::cuda::OptionalCUDAGuard device_guard(x_rot.device());
 
     auto out = torch::empty({OC},
         torch::TensorOptions().dtype(torch::kBFloat16).device(x_rot.device()));
