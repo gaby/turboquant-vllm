@@ -102,3 +102,23 @@ class TestPerProjectionBits:
         assert layer._tq_w2_weight.bits == 4
         mse2 = ((layer._tq_w2_weight.decompress().float() - w2_data.float()) ** 2).mean().item()
         assert mse2 < 0.05, f"w2 MSE {mse2:.4f} too high after geometry-derived decode"
+
+    def test_corrupt_packed_geometry_is_a_loud_error(self):
+        # Packed bytes that match NO supported width (not 2/3/4-bit layout)
+        # must still fail the layout validation, not decode as garbage.
+        torch.manual_seed(0)
+        w13_data = torch.randn(N_EXPERTS, W13_OUT, IN_DIM, dtype=torch.bfloat16)
+        w2_data = torch.randn(N_EXPERTS, W2_OUT, IN_DIM, dtype=torch.bfloat16)
+        w13_c = Compressed3D(w13_data, bits=3, group_size=GROUP_SIZE)
+        w2_c = Compressed3D(w2_data, bits=4, group_size=GROUP_SIZE)
+        # Chop one byte column off w2's packed data: numel no longer matches
+        # any packed_group_bytes(bits, group_size) multiple.
+        w2_c.packed = w2_c.packed[:, :-1].contiguous()
+        layer = _fake_layer(w13_c, w2_c)
+        with pytest.raises(ValueError):
+            _finalize_native_packed_moe(
+                layer,
+                _fake_method(bits=4, w13_bits=3, w2_bits=4),
+                {"w13_weight": tuple(w13_data.shape), "w2_weight": tuple(w2_data.shape)},
+                {"w13_weight": torch.bfloat16, "w2_weight": torch.bfloat16},
+            )

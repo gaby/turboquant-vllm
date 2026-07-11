@@ -902,6 +902,19 @@ def _finalize_native_packed_moe(
         if norms.ndim == 2 and norms.numel() > 0 and packed.numel() % norms.numel() == 0:
             derived = bits_from_packed_group_bytes(packed.numel() // norms.numel(), method.group_size)
             if derived is not None:
+                if derived != bits:
+                    # Usually a checkpoint whose expert names (w1/w2/w3) don't
+                    # match the config-side sensitive patterns — but the same
+                    # geometry would also result from a truncated shard whose
+                    # byte width happens to equal another supported width, so
+                    # leave a trace instead of overriding silently.
+                    logger.warning(
+                        "TurboQuant native MoE %s: packed geometry says %d-bit but config "
+                        "expected %d-bit; trusting the packed data",
+                        name,
+                        derived,
+                        bits,
+                    )
                 bits = derived
         shape = _resolve_native_moe_shape(packed, norms, param_shapes[name], bits, method.group_size)
         return Compressed3D.from_packed(
