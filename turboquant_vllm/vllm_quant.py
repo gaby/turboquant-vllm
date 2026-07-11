@@ -1666,6 +1666,16 @@ def _maybe_flush_native_moe_target(
         all_norms.append(torch.cat(norm_parts, dim=0) if len(norm_parts) > 1 else norm_parts[0])
 
     del target_state[target_key]
+    expert_widths = {t.shape[-1] for t in all_packed}
+    if len(expert_widths) > 1:
+        # Same invariant as the per-expert halves check above, across
+        # experts: one fused target stores every expert at one bit width.
+        raise ValueError(
+            f"Native MoE regroup for {target_key}: experts have mismatched packed "
+            f"widths {sorted(expert_widths)} — all experts of a fused projection must "
+            "be packed at the same bit width (check custom sensitive_patterns that "
+            "match only a subset of experts)."
+        )
     packed_out = torch.cat(all_packed, dim=0)
     norms_out = torch.cat(all_norms, dim=0)
     return [
@@ -1872,8 +1882,10 @@ def _patch_weight_name_remapping():
                 # in_dim recorded at pack time (standalone loaders truncate
                 # against the model's param shapes instead). A strided view
                 # suffices — vLLM's weight loaders copy_ from the source.
+                # Bound the value: a corrupt/hand-edited entry (e.g. negative)
+                # would otherwise silently tail-truncate via slice semantics.
                 true_in = orig_in_dims.get(base)
-                if true_in is not None:
+                if true_in is not None and 0 < true_in < w.shape[1]:
                     w = w[:, :true_in]
                 decompressed += 1
                 if decompressed % 200 == 0:

@@ -83,8 +83,10 @@ class TestPerProjectionBits:
         assert mse13 < 0.25, f"w13 (3-bit) MSE {mse13:.4f} too high"
         assert mse2 < 0.05, f"w2 (4-bit) MSE {mse2:.4f} too high"
 
-    def test_uniform_bits_fallback_for_methods_without_split(self):
-        # Test doubles / older methods without w13_bits/w2_bits still work
+    def test_methods_without_split_attrs_still_finalize(self):
+        # Test doubles / older methods without w13_bits/w2_bits must not
+        # AttributeError. (Bits themselves come from the packed geometry
+        # whenever it is readable, so this only exercises the attr access.)
         method = _fake_method(bits=3, w13_bits=3, w2_bits=3)
         del method.w13_bits, method.w2_bits
         layer, _, _ = _finalize(3, 3, method)

@@ -817,13 +817,23 @@ def normalize_sensitive_patterns(patterns) -> tuple[str, ...]:
     None (absent) falls back to the defaults. An explicit empty list is
     honored as "no sensitive layers". A bare string becomes a single
     pattern — tuple("down_proj") would explode it into nine one-character
-    patterns that substring-match nearly every tensor name.
+    patterns that substring-match nearly every tensor name. Anything else
+    that isn't a list of strings fails here, naming the field, instead of
+    surfacing as an unrelated TypeError on the first tensor decode.
     """
     if patterns is None:
         return _SENSITIVE_PATTERNS
     if isinstance(patterns, str):
         return (patterns,)
-    return tuple(patterns)
+    if isinstance(patterns, dict):
+        raise ValueError(f"sensitive_patterns must be a list of substrings or a string; got a mapping: {patterns!r}")
+    try:
+        result = tuple(patterns)
+    except TypeError:
+        raise ValueError(f"sensitive_patterns must be a list of substrings or a string; got {patterns!r}") from None
+    if not all(isinstance(p, str) for p in result):
+        raise ValueError(f"sensitive_patterns entries must all be strings; got {result!r}")
+    return result
 
 
 class Compressed3D:
