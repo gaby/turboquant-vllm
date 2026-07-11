@@ -755,7 +755,11 @@ class Compressed3D:
 
         grouped = padded.reshape(-1, group_size)
         quantizer = _get_quantizer(group_size, bits, str(data.device))
-        indices, norms = quantizer.quantize(grouped)
+        # norm_correction matches the Linear path (TurboQuantWrapper,
+        # TurboQuantOnlineLinearMethod) and the checkpoint exporter — without
+        # it, online-quantized MoE experts get systematically worse
+        # reconstruction than every other tensor in the model.
+        indices, norms = quantizer.quantize(grouped, norm_correction=True)
 
         self.packed = pack_indices(indices, bits)
         self.norms = norms.reshape(n_experts * out_dim, self.n_groups)
