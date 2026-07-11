@@ -902,15 +902,20 @@ def _finalize_native_packed_moe(
         if norms.ndim == 2 and norms.numel() > 0 and packed.numel() % norms.numel() == 0:
             derived = bits_from_packed_group_bytes(packed.numel() // norms.numel(), method.group_size)
             if derived is not None:
-                if derived != bits:
-                    # Usually a checkpoint whose expert names (w1/w2/w3) don't
-                    # match the config-side sensitive patterns — but the same
-                    # geometry would also result from a truncated shard whose
-                    # byte width happens to equal another supported width, so
-                    # leave a trace instead of overriding silently.
+                if derived != bits and (name, derived, bits) not in _geometry_bits_notices:
+                    # Once per (projection, widths) combo, not per layer: the
+                    # benign cause — expert names like w1/w2/w3 not matching
+                    # the config-side sensitive patterns — repeats identically
+                    # for every MoE layer of the model. The trace still
+                    # matters because the same geometry would also result
+                    # from a truncated shard whose byte width happens to
+                    # equal another supported width.
+                    _geometry_bits_notices.add((name, derived, bits))
                     logger.warning(
                         "TurboQuant native MoE %s: packed geometry says %d-bit but config "
-                        "expected %d-bit; trusting the packed data",
+                        "expected %d-bit; trusting the packed data. Benign when the "
+                        "checkpoint's expert names don't match the sensitive patterns; "
+                        "investigate if the checkpoint may be corrupt. (Logged once.)",
                         name,
                         derived,
                         bits,
@@ -1547,9 +1552,25 @@ def _regroup_native_moe_packed_tensors(
         all_norms = []
         for expert_idx in sorted(expert_data):
             packed_parts, norm_parts = expert_data[expert_idx]
+            widths = {p.shape[-1] for p in packed_parts}
+            if len(widths) > 1:
+                # Same invariant as _maybe_flush_native_moe_target: one fused
+                # target stores everything at one bit width.
+                raise ValueError(
+                    f"Native MoE regroup for {target_key}: expert {expert_idx} projection "
+                    f"halves have mismatched packed widths {sorted(widths)} — gate/up must "
+                    "be packed at the same bit width."
+                )
             all_packed.append(torch.cat(packed_parts, dim=0) if len(packed_parts) > 1 else packed_parts[0])
             all_norms.append(torch.cat(norm_parts, dim=0) if len(norm_parts) > 1 else norm_parts[0])
 
+        expert_widths = {t.shape[-1] for t in all_packed}
+        if len(expert_widths) > 1:
+            raise ValueError(
+                f"Native MoE regroup for {target_key}: experts have mismatched packed "
+                f"widths {sorted(expert_widths)} — all experts of a fused projection "
+                "must be packed at the same bit width."
+            )
         direct_targets.append((f"{target_key}_tq_packed", torch.cat(all_packed, dim=0)))
         direct_targets.append((f"{target_key}_tq_norms", torch.cat(all_norms, dim=0)))
 
@@ -1558,6 +1579,10 @@ def _regroup_native_moe_packed_tensors(
 
 _FLUSH_DEBUG_LIMIT = 5
 _flush_debug_count = {"no_regex": 0, "unknown_proj": 0, "no_target": 0, "wrong_shape": 0}
+
+# (projection, derived_bits, config_bits) combos already warned about in
+# _finalize_native_packed_moe — the benign cause repeats per layer.
+_geometry_bits_notices: set[tuple[str, int, int]] = set()
 
 
 def _maybe_flush_native_moe_target(

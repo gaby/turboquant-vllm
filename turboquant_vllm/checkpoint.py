@@ -708,7 +708,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
     sensitive_bits = tq_config.get("sensitive_bits")
-    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"))
+    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"), sensitive_bits)
 
     # Step 1: Create model on meta device (zero memory allocation)
     logger.info("Creating model skeleton on meta device...")

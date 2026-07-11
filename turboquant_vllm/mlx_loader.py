@@ -27,7 +27,7 @@ import mlx.nn as nn
 from turboquant_vllm.mlx_model import TurboQuantMLXLinear, TurboQuantMLXSwitchLinear
 from turboquant_vllm.mlx_ops import PolarQuantStateMLX
 from turboquant_vllm.torch_ops import PolarQuantTorch
-from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS, normalize_sensitive_patterns
+from turboquant_vllm.weight_quant import bits_from_packed_group_bytes, normalize_sensitive_patterns
 
 try:
     from mlx_lm.models.switch_layers import SwitchLinear
@@ -180,17 +180,31 @@ def _set_by_path(root: nn.Module, dotted: str, new_module: nn.Module) -> None:
     setattr(parent, parts[-1], new_module)
 
 
+def _bits_from_geometry(packed: mx.array, norms: mx.array, group_size: int) -> "int | None":
+    """Recover the packed bit width from tensor geometry.
+
+    Mirrors the vLLM loader: norms hold one entry per (row, group), so
+    ``packed.size / norms.size`` is the packed bytes-per-group, which maps
+    bijectively to the bit width for a fixed group_size. This is the ground
+    truth — name-pattern matching can disagree with how a tensor was packed
+    (MLX module paths are renamed from the HF names the saver matched on).
+    Returns None when the geometry is unreadable.
+    """
+    if norms.size == 0 or packed.size % norms.size != 0:
+        return None
+    return bits_from_packed_group_bytes(packed.size // norms.size, group_size)
+
+
 def _replace_linears_with_tq(
     model: nn.Module,
     weights: dict[str, mx.array],
-    default_state: PolarQuantStateMLX,
-    sensitive_state: PolarQuantStateMLX | None,
-    sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS,
+    pick_state,
 ) -> set[str]:
     """Replace each Linear whose packed form is present in ``weights``.
 
-    Returns the set of weight keys consumed (so the caller can skip them
-    when calling ``model.load_weights``).
+    ``pick_state(name, packed, norms)`` returns the PolarQuantStateMLX for
+    that layer. Returns the set of weight keys consumed (so the caller can
+    skip them when calling ``model.load_weights``).
     """
     consumed: set[str] = set()
 
@@ -204,8 +218,7 @@ def _replace_linears_with_tq(
 
         out_features, in_features = module.weight.shape
 
-        use_sensitive = sensitive_state is not None and any(p in name for p in sensitive_patterns)
-        state = sensitive_state if use_sensitive else default_state
+        state = pick_state(name, weights[packed_key], weights[norms_key])
 
         bias_key = f"{name}.bias"
         bias = weights.get(bias_key)
@@ -231,9 +244,7 @@ def _replace_linears_with_tq(
 def _replace_switch_linears_with_tq(
     model: nn.Module,
     weights: dict[str, mx.array],
-    default_state: PolarQuantStateMLX,
-    sensitive_state: PolarQuantStateMLX | None,
-    sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS,
+    pick_state,
 ) -> set[str]:
     """Replace each SwitchLinear whose packed form is in ``weights``.
 
@@ -257,8 +268,7 @@ def _replace_switch_linears_with_tq(
 
         num_experts, out_features, in_features = module.weight.shape
 
-        use_sensitive = sensitive_state is not None and any(p in name for p in sensitive_patterns)
-        state = sensitive_state if use_sensitive else default_state
+        state = pick_state(name, weights[packed_key], weights[norms_key])
 
         bias_key = f"{name}.bias"
         bias = weights.get(bias_key)
@@ -318,7 +328,7 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
     # Honor the checkpoint's own pattern list (matches the torch and vLLM
     # loaders) — a hardcoded list here decoded custom-pattern checkpoints
     # at the wrong per-layer width on the Mac path.
-    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"))
+    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"), sensitive_bits)
 
     config = load_config(model_path)
     _rewrite_legacy_rope_keys(config)
@@ -335,15 +345,28 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
         weights = model.sanitize(weights)
     _split_fused_gate_up_proj_packed(weights, model)
 
-    default_state = _build_state(group_size, bits, seed)
-    sensitive_state = (
-        _build_state(group_size, sensitive_bits, seed)
-        if sensitive_bits is not None and sensitive_bits != bits
-        else None
-    )
+    # One PolarQuantStateMLX per bit width, built on demand. The width for
+    # each layer comes from its packed geometry (the ground truth); the
+    # sensitive-pattern match is only the fallback for unreadable geometry —
+    # MLX module paths are renamed from the HF tensor names the saver
+    # matched on, so name patterns alone can pick the wrong width.
+    state_cache: dict[int, PolarQuantStateMLX] = {}
 
-    consumed = _replace_linears_with_tq(model, weights, default_state, sensitive_state, sensitive_patterns)
-    consumed |= _replace_switch_linears_with_tq(model, weights, default_state, sensitive_state, sensitive_patterns)
+    def _state_for_bits(layer_bits: int) -> PolarQuantStateMLX:
+        if layer_bits not in state_cache:
+            state_cache[layer_bits] = _build_state(group_size, layer_bits, seed)
+        return state_cache[layer_bits]
+
+    def _pick_state(name: str, packed: mx.array, norms: mx.array) -> PolarQuantStateMLX:
+        derived = _bits_from_geometry(packed, norms, group_size)
+        if derived is not None:
+            return _state_for_bits(derived)
+        if sensitive_bits is not None and any(p in name for p in sensitive_patterns):
+            return _state_for_bits(sensitive_bits)
+        return _state_for_bits(bits)
+
+    consumed = _replace_linears_with_tq(model, weights, _pick_state)
+    consumed |= _replace_switch_linears_with_tq(model, weights, _pick_state)
 
     # Remaining keys: uncompressed tensors (embeddings, norms, biases that
     # weren't part of a replacement, scales). Any leftover ``.tq_packed`` /

@@ -811,7 +811,7 @@ def select_bits(
     return default_bits
 
 
-def normalize_sensitive_patterns(patterns) -> tuple[str, ...]:
+def normalize_sensitive_patterns(patterns, sensitive_bits: "int | None" = None) -> tuple[str, ...]:
     """Normalize a config-supplied sensitive_patterns value.
 
     None (absent) falls back to the defaults. An explicit empty list is
@@ -820,20 +820,36 @@ def normalize_sensitive_patterns(patterns) -> tuple[str, ...]:
     patterns that substring-match nearly every tensor name. Anything else
     that isn't a list of strings fails here, naming the field, instead of
     surfacing as an unrelated TypeError on the first tensor decode.
+
+    When ``sensitive_bits`` is None the field is inert (``select_bits``
+    never reads the patterns), so a malformed value in a legacy or
+    hand-edited config only logs a warning rather than making the
+    checkpoint unloadable over a field nothing will consume.
     """
     if patterns is None:
         return _SENSITIVE_PATTERNS
-    if isinstance(patterns, str):
-        return (patterns,)
-    if isinstance(patterns, dict):
-        raise ValueError(f"sensitive_patterns must be a list of substrings or a string; got a mapping: {patterns!r}")
     try:
-        result = tuple(patterns)
-    except TypeError:
-        raise ValueError(f"sensitive_patterns must be a list of substrings or a string; got {patterns!r}") from None
-    if not all(isinstance(p, str) for p in result):
-        raise ValueError(f"sensitive_patterns entries must all be strings; got {result!r}")
-    return result
+        if isinstance(patterns, str):
+            return (patterns,)
+        if isinstance(patterns, dict):
+            raise ValueError(
+                f"sensitive_patterns must be a list of substrings or a string; got a mapping: {patterns!r}"
+            )
+        try:
+            result = tuple(patterns)
+        except TypeError:
+            raise ValueError(f"sensitive_patterns must be a list of substrings or a string; got {patterns!r}") from None
+        if not all(isinstance(p, str) for p in result):
+            raise ValueError(f"sensitive_patterns entries must all be strings; got {result!r}")
+        return result
+    except ValueError:
+        if sensitive_bits is None:
+            logger.warning(
+                "Ignoring malformed sensitive_patterns %r: the field is unused without sensitive_bits",
+                patterns,
+            )
+            return _SENSITIVE_PATTERNS
+        raise
 
 
 class Compressed3D:
