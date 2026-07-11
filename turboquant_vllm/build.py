@@ -78,9 +78,69 @@ def _detect_local_arches() -> list[str]:
     return sorted(arches, key=int)
 
 
+# nvcc toolkit version that introduced each SM target. Datacenter Blackwell
+# (B200 = sm_100, B300/GB300 = sm_103) and consumer/DGX-Spark Blackwell
+# (sm_120 / sm_121) need CUDA 12.8/12.9; Thor (sm_110) needs CUDA 13.0.
+_ARCH_MIN_CUDA: dict[int, tuple[int, int]] = {
+    70: (9, 0),
+    72: (9, 0),
+    75: (10, 0),
+    80: (11, 0),
+    86: (11, 1),
+    87: (11, 4),
+    89: (11, 8),
+    90: (11, 8),
+    100: (12, 8),
+    101: (12, 8),
+    103: (12, 9),
+    110: (13, 0),
+    120: (12, 8),
+    121: (12, 9),
+}
+
+# Newest-first candidates for a virtual (PTX) target when the toolkit cannot
+# emit SASS for the local GPU. PTX is forward-JIT-compiled by the driver, so
+# e.g. compute_90 PTX runs on sm_100/sm_103 hardware under a CUDA 12.4 torch.
+# Embedded/Tegra targets (72, 87, 101, 110, 121) are excluded — their PTX is
+# not a sensible base for discrete GPUs.
+_PTX_FALLBACK_CANDIDATES = (120, 103, 100, 90, 89, 86, 80, 75, 70)
+
+
+def _arch_supported_by_cuda(arch_num: int, cuda_version: tuple[int, int]) -> bool:
+    """Whether the nvcc toolkit at ``cuda_version`` can compile ``arch_num``.
+
+    An unknown toolkit version ``(0, 0)`` returns True — don't second-guess
+    explicit user requests when torch reports no CUDA version.
+    """
+    if cuda_version <= (0, 0):
+        return True
+    if cuda_version < _ARCH_MIN_CUDA.get(arch_num, (0, 0)):
+        return False
+    # CUDA 13.0 removed all pre-Turing targets (minimum is sm_75).
+    if cuda_version >= (13, 0) and arch_num < 75:
+        return False
+    return True
+
+
+def _ptx_fallback_arch(arch_num: int, cuda_version: tuple[int, int]) -> int | None:
+    """Best virtual (PTX) target ≤ ``arch_num`` the toolkit can emit."""
+    for candidate in _PTX_FALLBACK_CANDIDATES:
+        if candidate <= arch_num and _arch_supported_by_cuda(candidate, cuda_version):
+            return candidate
+    return None
+
+
+def _sass_flag(arch_num: int) -> str:
+    return f"-gencode=arch=compute_{arch_num},code=sm_{arch_num}"
+
+
+def _ptx_flag(arch_num: int) -> str:
+    return f"-gencode=arch=compute_{arch_num},code=compute_{arch_num}"
+
+
 def _gencode_flags() -> list[str]:
     """Build a compact gencode list for the current runtime host."""
-    cuda_major, cuda_minor = _cuda_version_tuple()
+    cuda_version = _cuda_version_tuple()
 
     override = os.environ.get("TQ_CUDA_ARCH_LIST") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if override:
@@ -91,40 +151,90 @@ def _gencode_flags() -> list[str]:
             if not token.isdigit():
                 continue
             arch_num = int(token)
-            if arch_num == 121 and (cuda_major, cuda_minor) < (12, 9):
+            if not _arch_supported_by_cuda(arch_num, cuda_version):
+                logger.warning(
+                    "Skipping requested CUDA arch sm_%d: not compilable by CUDA %d.%d",
+                    arch_num,
+                    *cuda_version,
+                )
                 continue
-            flags.append(f"-gencode=arch=compute_{arch_num},code=sm_{arch_num}")
+            flags.append(_sass_flag(arch_num))
         if flags:
             return flags
 
     local_arches = _detect_local_arches()
     if local_arches:
         flags = []
+        ptx_arches: set[int] = set()
         for arch in local_arches:
             arch_num = int(arch)
-            if arch_num == 121 and (cuda_major, cuda_minor) < (12, 9):
+            if _arch_supported_by_cuda(arch_num, cuda_version):
+                flags.append(_sass_flag(arch_num))
                 continue
-            flags.append(f"-gencode=arch=compute_{arch_num},code=sm_{arch_num}")
+            # Toolkit too old for this GPU (e.g. B200/sm_100 or B300/sm_103
+            # under CUDA < 12.8/12.9). Emit the newest PTX the toolkit knows
+            # so the driver can JIT for the local arch, instead of failing
+            # the whole nvcc invocation on an unknown compute_XXX.
+            ptx_arch = _ptx_fallback_arch(arch_num, cuda_version)
+            if ptx_arch is None:
+                logger.warning(
+                    "Local CUDA arch sm_%d is not compilable by CUDA %d.%d and no PTX fallback exists",
+                    arch_num,
+                    *cuda_version,
+                )
+                continue
+            logger.warning(
+                "Local CUDA arch sm_%d is not compilable by CUDA %d.%d; "
+                "emitting compute_%d PTX for driver-side JIT instead. "
+                "Upgrade to a CUDA >= %d.%d torch build for native SASS.",
+                arch_num,
+                *cuda_version,
+                ptx_arch,
+                *_ARCH_MIN_CUDA.get(arch_num, (0, 0)),
+            )
+            ptx_arches.add(ptx_arch)
+        flags.extend(_ptx_flag(a) for a in sorted(ptx_arches))
         if flags:
             return flags
 
-    # Fallback for environments where no GPU is visible during build.
+    # Fallback for environments where no GPU is visible during build: cover
+    # the common datacenter/workstation SASS targets the toolkit supports,
+    # plus one PTX target for forward compatibility with newer arches.
     flags = [
-        "-gencode=arch=compute_80,code=sm_80",
-        "-gencode=arch=compute_86,code=sm_86",
-        "-gencode=arch=compute_89,code=sm_89",
-        "-gencode=arch=compute_90,code=sm_90",
+        _sass_flag(80),
+        _sass_flag(86),
+        _sass_flag(89),
+        _sass_flag(90),
     ]
-    if (cuda_major, cuda_minor) >= (12, 9):
-        flags.append("-gencode=arch=compute_121,code=sm_121")
+    if cuda_version > (0, 0):
+        for arch_num in (100, 103, 120, 121):
+            if _arch_supported_by_cuda(arch_num, cuda_version):
+                flags.append(_sass_flag(arch_num))
+    if _arch_supported_by_cuda(90, cuda_version) and cuda_version >= (11, 8):
+        flags.append(_ptx_flag(90))
+    else:
+        flags.append(_ptx_flag(80))
     return flags
 
 
 def _arches_from_gencode_flags(flags: list[str]) -> list[str]:
-    """Extract SM targets like ``["80", "121"]`` from nvcc gencode flags."""
+    """Extract SM (SASS) targets like ``["80", "121"]`` from nvcc gencode flags."""
     arches: set[str] = set()
     for flag in flags:
         marker = "code=sm_"
+        if marker not in flag:
+            continue
+        arch = flag.split(marker, 1)[1].split(",", 1)[0].strip()
+        if arch.isdigit():
+            arches.add(arch)
+    return sorted(arches, key=int)
+
+
+def _ptx_arches_from_gencode_flags(flags: list[str]) -> list[str]:
+    """Extract virtual (PTX) targets like ``["90"]`` from nvcc gencode flags."""
+    arches: set[str] = set()
+    for flag in flags:
+        marker = "code=compute_"
         if marker not in flag:
             continue
         arch = flag.split(marker, 1)[1].split(",", 1)[0].strip()
@@ -151,7 +261,27 @@ def _prebuilt_manifest_path(path: Path) -> Path:
     return path.with_name(path.name + PREBUILT_MANIFEST_SUFFIX)
 
 
+def _parse_manifest_arches(raw) -> set[str]:
+    if not isinstance(raw, list):
+        return set()
+    parsed = {str(arch).replace(".", "") for arch in raw}
+    return {arch for arch in parsed if arch.isdigit()}
+
+
 def _read_prebuilt_arches(path: Path) -> set[str] | None:
+    """Return the SASS arches from the sidecar manifest, or None if unusable."""
+    manifest = _read_prebuilt_manifest(path)
+    if manifest is None:
+        return None
+    return manifest[0]
+
+
+def _read_prebuilt_manifest(path: Path) -> tuple[set[str], set[str]] | None:
+    """Return ``(sass_arches, ptx_arches)`` from the sidecar manifest.
+
+    ``ptx_arches`` is empty for manifests written before PTX targets were
+    recorded — those behave exactly as before.
+    """
     manifest = _prebuilt_manifest_path(path)
     if not manifest.is_file():
         return None
@@ -161,12 +291,10 @@ def _read_prebuilt_arches(path: Path) -> set[str] | None:
         logger.warning("Could not read TurboQuant prebuilt manifest %s: %s", manifest, exc)
         return None
 
-    arches = data.get("arches")
-    if not isinstance(arches, list):
+    if not isinstance(data.get("arches"), list):
         logger.warning("TurboQuant prebuilt manifest %s has no arches list", manifest)
         return None
-    parsed = {str(arch).replace(".", "") for arch in arches}
-    return {arch for arch in parsed if arch.isdigit()}
+    return _parse_manifest_arches(data.get("arches")), _parse_manifest_arches(data.get("ptx"))
 
 
 def _prebuilt_is_compatible(path: Path) -> bool:
@@ -192,8 +320,8 @@ def _prebuilt_is_compatible(path: Path) -> bool:
         )
         return True
 
-    prebuilt_arches = _read_prebuilt_arches(path)
-    if prebuilt_arches is None:
+    manifest = _read_prebuilt_manifest(path)
+    if manifest is None:
         logger.warning(
             "Skipping unverified TurboQuant prebuilt extension %s on CUDA arches %s; "
             "falling back to local JIT. Set TQ_CUDA_ALLOW_UNVERIFIED_PREBUILT=1 to override.",
@@ -202,13 +330,19 @@ def _prebuilt_is_compatible(path: Path) -> bool:
         )
         return False
 
+    prebuilt_arches, ptx_arches = manifest
     missing = local_arches - prebuilt_arches
+    # A local arch without exact SASS is still covered when the prebuilt
+    # embeds PTX at or below that arch — the driver JIT-compiles PTX forward
+    # (e.g. compute_90 PTX runs on sm_100 B200 / sm_103 B300 hardware).
+    missing = {arch for arch in missing if not any(int(ptx) <= int(arch) for ptx in ptx_arches)}
     if missing:
         logger.warning(
-            "Skipping TurboQuant prebuilt extension %s: manifest arches %s do not cover "
-            "local CUDA arches %s; missing %s. Falling back to local JIT.",
+            "Skipping TurboQuant prebuilt extension %s: manifest arches %s (ptx %s) do not "
+            "cover local CUDA arches %s; missing %s. Falling back to local JIT.",
             path,
             sorted(prebuilt_arches, key=int),
+            sorted(ptx_arches, key=int),
             sorted(local_arches, key=int),
             sorted(missing, key=int),
         )
@@ -249,14 +383,15 @@ def _load_prebuilt_module():
     return None
 
 
-def _bundle_module(module, arches: list[str]) -> Path:
+def _bundle_module(module, arches: list[str], ptx_arches: list[str] | None = None) -> Path:
     """Copy the compiled extension into the package for runtime reuse."""
     PREBUILT_DIR.mkdir(parents=True, exist_ok=True)
     source = Path(module.__file__).resolve()
     target = PREBUILT_DIR / source.name
     if source != target:
         shutil.copy2(source, target)
-    _prebuilt_manifest_path(target).write_text(json.dumps({"arches": arches}, indent=2) + "\n")
+    manifest = {"arches": arches, "ptx": ptx_arches or []}
+    _prebuilt_manifest_path(target).write_text(json.dumps(manifest, indent=2) + "\n")
     logger.warning("Bundled TurboQuant CUDA extension to %s", target)
     return target
 
@@ -306,7 +441,11 @@ def build():
         verbose=True,
     )
     if os.environ.get("TQ_CUDA_BUNDLE", "0") == "1":
-        _bundle_module(module, _arches_from_gencode_flags(gencode_flags))
+        _bundle_module(
+            module,
+            _arches_from_gencode_flags(gencode_flags),
+            _ptx_arches_from_gencode_flags(gencode_flags),
+        )
     return module
 
 
