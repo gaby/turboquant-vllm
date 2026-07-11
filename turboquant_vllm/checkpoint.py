@@ -1013,14 +1013,32 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 )
                 continue
 
-            # Stack: concat fused parts per expert, then cat across experts
+            # Stack: concat fused parts per expert, then cat across experts.
+            # One fused target stores everything at one bit width, so any
+            # packed-width mismatch (custom sensitive_patterns matching only
+            # one half or a subset of experts) must fail with a named error
+            # rather than torch.cat's anonymous size mismatch.
             all_packed = []
             all_norms = []
             for eidx in sorted(expert_data.keys()):
                 pks, nks = expert_data[eidx]
+                widths = {p.shape[-1] for p in pks}
+                if len(widths) > 1:
+                    raise ValueError(
+                        f"Native MoE regroup for {target_key}: expert {eidx} projection halves "
+                        f"have mismatched packed widths {sorted(widths)} — gate/up must be "
+                        "packed at the same bit width."
+                    )
                 all_packed.append(torch.cat(pks, dim=0) if len(pks) > 1 else pks[0])
                 all_norms.append(torch.cat(nks, dim=0) if len(nks) > 1 else nks[0])
 
+            expert_widths = {t.shape[-1] for t in all_packed}
+            if len(expert_widths) > 1:
+                raise ValueError(
+                    f"Native MoE regroup for {target_key}: experts have mismatched packed "
+                    f"widths {sorted(expert_widths)} — all experts of a fused projection "
+                    "must be packed at the same bit width."
+                )
             stacked_packed = torch.cat(all_packed, dim=0)
             stacked_norms = torch.cat(all_norms, dim=0)
 

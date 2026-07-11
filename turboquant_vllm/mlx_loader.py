@@ -27,6 +27,7 @@ import mlx.nn as nn
 from turboquant_vllm.mlx_model import TurboQuantMLXLinear, TurboQuantMLXSwitchLinear
 from turboquant_vllm.mlx_ops import PolarQuantStateMLX
 from turboquant_vllm.torch_ops import PolarQuantTorch
+from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS, normalize_sensitive_patterns
 
 try:
     from mlx_lm.models.switch_layers import SwitchLinear
@@ -37,11 +38,6 @@ except ImportError:
     _HAS_SWITCH_LINEAR = False
 
 logger = logging.getLogger(__name__)
-
-# Layers that benefit from higher precision. Mirrors
-# weight_quant._SENSITIVE_PATTERNS so sensitive_bits in tq_config
-# routes the right layers to the higher-bit quantizer state.
-_SENSITIVE_PATTERNS = ("o_proj", "down_proj")
 
 
 def _build_state(group_size: int, bits: int, seed: int) -> PolarQuantStateMLX:
@@ -189,6 +185,7 @@ def _replace_linears_with_tq(
     weights: dict[str, mx.array],
     default_state: PolarQuantStateMLX,
     sensitive_state: PolarQuantStateMLX | None,
+    sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS,
 ) -> set[str]:
     """Replace each Linear whose packed form is present in ``weights``.
 
@@ -207,7 +204,7 @@ def _replace_linears_with_tq(
 
         out_features, in_features = module.weight.shape
 
-        use_sensitive = sensitive_state is not None and any(p in name for p in _SENSITIVE_PATTERNS)
+        use_sensitive = sensitive_state is not None and any(p in name for p in sensitive_patterns)
         state = sensitive_state if use_sensitive else default_state
 
         bias_key = f"{name}.bias"
@@ -236,6 +233,7 @@ def _replace_switch_linears_with_tq(
     weights: dict[str, mx.array],
     default_state: PolarQuantStateMLX,
     sensitive_state: PolarQuantStateMLX | None,
+    sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS,
 ) -> set[str]:
     """Replace each SwitchLinear whose packed form is in ``weights``.
 
@@ -259,7 +257,7 @@ def _replace_switch_linears_with_tq(
 
         num_experts, out_features, in_features = module.weight.shape
 
-        use_sensitive = sensitive_state is not None and any(p in name for p in _SENSITIVE_PATTERNS)
+        use_sensitive = sensitive_state is not None and any(p in name for p in sensitive_patterns)
         state = sensitive_state if use_sensitive else default_state
 
         bias_key = f"{name}.bias"
@@ -317,6 +315,10 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
     group_size = tq_config["group_size"]
     seed = tq_config.get("quantizer_seed", 42)
     sensitive_bits = tq_config.get("sensitive_bits")
+    # Honor the checkpoint's own pattern list (matches the torch and vLLM
+    # loaders) — a hardcoded list here decoded custom-pattern checkpoints
+    # at the wrong per-layer width on the Mac path.
+    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"))
 
     config = load_config(model_path)
     _rewrite_legacy_rope_keys(config)
@@ -340,8 +342,8 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
         else None
     )
 
-    consumed = _replace_linears_with_tq(model, weights, default_state, sensitive_state)
-    consumed |= _replace_switch_linears_with_tq(model, weights, default_state, sensitive_state)
+    consumed = _replace_linears_with_tq(model, weights, default_state, sensitive_state, sensitive_patterns)
+    consumed |= _replace_switch_linears_with_tq(model, weights, default_state, sensitive_state, sensitive_patterns)
 
     # Remaining keys: uncompressed tensors (embeddings, norms, biases that
     # weren't part of a replacement, scales). Any leftover ``.tq_packed`` /
