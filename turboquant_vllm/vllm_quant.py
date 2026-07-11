@@ -87,10 +87,10 @@ if LinearBase is not None:
                 raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
             # The WHT rotation requires a power of two — non-power-of-two
             # multiples of 8 (e.g. 96) used to fail deep in the kernels with
-            # an obscure error. Sizes below 64 stay valid (tests and
-            # tiny-tensor checkpoints use 8) via the PyTorch path; the
-            # CUDA/Triton kernels enforce their own 64/128/256 support at
-            # dispatch time.
+            # an obscure error. Sizes outside 64/128/256 stay valid (tests
+            # and tiny-tensor checkpoints use 8) but run on the pure-PyTorch
+            # path: process_weights_after_loading only binds the Triton/CUDA
+            # kernels for the sizes they are compiled for.
             if group_size < 8 or group_size & (group_size - 1) != 0:
                 raise ValueError(f"turboquant group_size must be a power of two >= 8; got {group_size}")
             if sensitive_bits is not None and sensitive_bits not in (2, 3, 4):
@@ -287,10 +287,14 @@ if LinearBase is not None:
             layer.tq_out_features = out_dim
             layer.tq_padded_in = padded_in
 
-            # Cache dispatch — must run before CUDA graph capture
+            # Cache dispatch — must run before CUDA graph capture. The
+            # Triton/CUDA kernels are built for exactly these group sizes;
+            # anything else (e.g. group_size=8 test configs) must take the
+            # pure-PyTorch path in apply() rather than crash at dispatch.
+            kernels_support_group = group_size in (64, 128, 256)
             _ensure_triton_backends()
             cuda_mod = _get_cuda_module()
-            if _triton_available:
+            if _triton_available and kernels_support_group:
                 layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
                 layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
             else:
@@ -301,7 +305,12 @@ if LinearBase is not None:
             # apply() doesn't run an import statement per forward.
             layer._tq_cuda_gemm_fn = (
                 _tq_cuda_dequant_gemm_fn
-                if (not _triton_available and cuda_mod is not None and _tq_cuda_dequant_gemm_fn is not None)
+                if (
+                    layer._tq_primary_fn is None
+                    and kernels_support_group
+                    and cuda_mod is not None
+                    and _tq_cuda_dequant_gemm_fn is not None
+                )
                 else None
             )
 
@@ -492,10 +501,15 @@ def _materialize_and_process(layer, state, method):
     param_shapes = state["param_shapes"]
     param_dtypes = state["param_dtypes"]
     target_device = _materialize_target_device()
-    # 1. Materialize meta → real tensors on GPU
+    # 1. Materialize meta → real tensors on GPU. Zero-filled, not empty:
+    # untracked params (e.g. biases arriving after the w13/w2 completion
+    # threshold fires) and loader-less params may have no buffered load to
+    # replay, and the unquant process_weights_after_loading inside
+    # _do_compress reads them — zeros are the safe neutral value, and any
+    # late checkpoint load still overwrites them through the live param.
     for name, param in list(layer.named_parameters(recurse=False)):
         if param.device == torch.device("meta") and name in param_shapes:
-            real = torch.empty(
+            real = torch.zeros(
                 param_shapes[name],
                 dtype=param_dtypes[name],
                 device=target_device,
@@ -537,13 +551,18 @@ def _finish_online_moe_load(layer, method, pending_state) -> None:
         buffer = pending_state["buffer"]
         if buffer:
             # A non-empty buffer is not proof of completeness: every meta
-            # param that materialize would allocate must have at least one
-            # buffered load, or its torch.empty garbage gets compressed.
+            # param that CAN be checkpoint-loaded (i.e. has a weight_loader)
+            # must have at least one buffered load before compression bakes
+            # its values. Loader-less params are exempt — the checkpoint can
+            # never populate them and materialize zero-fills them instead.
             buffered_params = {pname for pname, _, _ in buffer}
             unloaded = [
                 name
                 for name, param in layer.named_parameters(recurse=False)
-                if param.is_meta and name in pending_state["param_shapes"] and name not in buffered_params
+                if param.is_meta
+                and name in pending_state["param_shapes"]
+                and name in pending_state["orig_loaders"]
+                and name not in buffered_params
             ]
             if unloaded:
                 raise RuntimeError(
@@ -1138,6 +1157,16 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
                 def _buffering_loader(*args, **kwargs):
                     if materialized[0]:
+                        # Loads can legitimately arrive after the threshold
+                        # fired (untracked biases ordered after the last
+                        # expert weight). vLLM's caller may still hold the
+                        # pre-materialization meta param (params_dict is
+                        # built once per load pass), so route the write into
+                        # the live registered param.
+                        if len(args) > 1:
+                            current = getattr(layer, param_name, None)
+                            if current is not None:
+                                return orig_loader(current, *args[1:], **kwargs)
                         return orig_loader(*args, **kwargs)
                     buffer.append((param_name, args, kwargs))
                     if counted:

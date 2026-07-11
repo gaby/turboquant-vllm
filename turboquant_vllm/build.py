@@ -111,6 +111,22 @@ _PTX_FALLBACK_CANDIDATES = (120, 103, 100, 90, 89, 86, 80, 75, 70)
 # major CUDA release drops more targets.
 _CUDA13_MIN_ARCH = 75
 
+# Named architectures accepted by PyTorch's TORCH_CUDA_ARCH_LIST (see
+# torch.utils.cpp_extension._get_cuda_arch_flags) mapped to the SM targets
+# they expand to for discrete GPUs.
+_NAMED_ARCH_TOKENS: dict[str, tuple[int, ...]] = {
+    "TURING": (75,),
+    "AMPERE": (80, 86),
+    "ADA": (89,),
+    "HOPPER": (90,),
+    "BLACKWELL": (100, 120),
+}
+
+# "9.0a" / "12.0f" style tokens: the trailing letter selects an
+# arch-conditional (a) or family (f) feature set. Our kernels use neither,
+# so the base SM target is the right translation.
+_ARCH_TOKEN_RE = re.compile(r"^(\d+)[AF]?$")
+
 
 def _arch_supported_by_cuda(arch_num: int, cuda_version: tuple[int, int]) -> bool:
     """Whether the nvcc toolkit at ``cuda_version`` can compile ``arch_num``.
@@ -150,28 +166,34 @@ def _gencode_flags() -> list[str]:
     override = os.environ.get("TQ_CUDA_ARCH_LIST") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if override:
         # TORCH_CUDA_ARCH_LIST conventionally separates entries with spaces
-        # ("8.0 9.0+PTX"), but commas/semicolons are also seen in the wild.
+        # ("8.0 9.0+PTX", "Hopper", "9.0a"), but commas/semicolons are also
+        # seen in the wild.
         arch_tokens = [tok for tok in re.split(r"[,;\s]+", override) if tok]
         flags: list[str] = []
         for token in arch_tokens:
             wants_ptx = token.upper().endswith("+PTX")
             if wants_ptx:
                 token = token[: -len("+PTX")]
-            token = token.replace(".", "")
-            if not token.isdigit():
-                logger.warning("Ignoring unrecognized CUDA arch token %r in arch-list override", token)
-                continue
-            arch_num = int(token)
-            if not _arch_supported_by_cuda(arch_num, cuda_version):
-                logger.warning(
-                    "Skipping requested CUDA arch sm_%d: not compilable by CUDA %d.%d",
-                    arch_num,
-                    *cuda_version,
-                )
-                continue
-            flags.append(_sass_flag(arch_num))
-            if wants_ptx:
-                flags.append(_ptx_flag(arch_num))
+            named = _NAMED_ARCH_TOKENS.get(token.upper())
+            if named is not None:
+                arch_nums = list(named)
+            else:
+                match = _ARCH_TOKEN_RE.match(token.replace(".", "").upper())
+                if match is None:
+                    logger.warning("Ignoring unrecognized CUDA arch token %r in arch-list override", token)
+                    continue
+                arch_nums = [int(match.group(1))]
+            for arch_num in arch_nums:
+                if not _arch_supported_by_cuda(arch_num, cuda_version):
+                    logger.warning(
+                        "Skipping requested CUDA arch sm_%d: not compilable by CUDA %d.%d",
+                        arch_num,
+                        *cuda_version,
+                    )
+                    continue
+                flags.append(_sass_flag(arch_num))
+                if wants_ptx:
+                    flags.append(_ptx_flag(arch_num))
         if flags:
             return flags
 

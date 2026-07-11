@@ -164,6 +164,37 @@ def test_finish_raises_when_buffer_covers_only_some_params():
     assert method.compressed == 0
 
 
+def test_finish_ignores_loaderless_params_in_coverage_check():
+    """Params without a weight_loader can never be checkpoint-loaded; the
+    completeness check must not demand buffered loads for them (materialize
+    zero-fills them instead)."""
+    layer = _Layer()
+    layer.register_parameter(
+        "w13_weight",
+        nn.Parameter(torch.empty(2, 4, 8, device="meta"), requires_grad=False),
+    )
+    layer.register_parameter(
+        "aux_table",
+        nn.Parameter(torch.empty(2, 4, device="meta"), requires_grad=False),
+    )
+    w13_data = torch.randn(2, 4, 8)
+    buffer = [("w13_weight", (layer.w13_weight, w13_data), {})]
+    state = {
+        "buffer": buffer,
+        "orig_loaders": {"w13_weight": _copy_loader},  # aux_table has no loader
+        "param_shapes": {name: tuple(p.shape) for name, p in layer.named_parameters(recurse=False)},
+        "param_dtypes": {name: p.dtype for name, p in layer.named_parameters(recurse=False)},
+        "materialized": [False],
+    }
+    method = _FakeMethod()
+
+    _finish_online_moe_load(layer, method, state)
+
+    assert method.compressed == 1
+    assert not layer.aux_table.is_meta
+    assert layer.aux_table.data.abs().sum().item() == 0.0
+
+
 def test_finish_raises_on_meta_weights_with_nothing_to_replay():
     """Meta params report numel() > 0, so compressing without a replay would
     bake uninitialized data — this must be a loud error instead."""

@@ -100,6 +100,25 @@ def test_gencode_override_accepts_torch_space_separated_format(monkeypatch, no_a
     ]
 
 
+def test_gencode_override_accepts_named_and_suffixed_arches(monkeypatch, no_arch_override):
+    """PyTorch also accepts named arches ('Hopper') and feature-suffixed
+    numeric arches ('9.0a', '12.0f'); both must not be silently dropped."""
+    monkeypatch.setattr(tq_build, "_cuda_version_tuple", lambda: (12, 9))
+    monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "Hopper+PTX")
+    assert tq_build._gencode_flags() == [
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_90,code=compute_90",
+    ]
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0a 12.0f")
+    assert tq_build._gencode_flags() == [
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_120,code=sm_120",
+    ]
+
+
 def test_gencode_fallback_list_per_cuda_version(monkeypatch, no_arch_override):
     monkeypatch.setattr(tq_build, "_detect_local_arches", lambda: [])
 
