@@ -418,6 +418,11 @@ def save_tq3_checkpoint(
     total_original = 0
     total_compressed = 0
     compressed_count = 0
+    # True (pre-padding) in_dim for compressed weights whose last dim is not
+    # a multiple of group_size. The packed format only preserves the padded
+    # width, so loaders need this to truncate back (see tq_config.json's
+    # "orig_in_dims").
+    orig_in_dims: dict[str, int] = {}
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -492,6 +497,8 @@ def save_tq3_checkpoint(
                     packed, norms = _compress_tensor(tensor, tensor_quantizer, tensor_bits, group_size)
                     _add_tensor(tensor_name + ".tq_packed", packed)
                     _add_tensor(tensor_name + ".tq_norms", norms)
+                    if tensor.shape[-1] % group_size != 0:
+                        orig_in_dims[tensor_name] = int(tensor.shape[-1])
 
                     comp_bytes = packed.numel() + norms.numel() * norms.element_size()
                     total_compressed += comp_bytes
@@ -561,6 +568,8 @@ def save_tq3_checkpoint(
     if sensitive_bits is not None:
         tq_config["sensitive_bits"] = sensitive_bits
         tq_config["sensitive_patterns"] = list(_SENSITIVE_PATTERNS)
+    if orig_in_dims:
+        tq_config["orig_in_dims"] = orig_in_dims
     with open(os.path.join(output_dir, "tq_config.json"), "w") as f:
         json.dump(tq_config, f, indent=2)
 
@@ -1112,8 +1121,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
 
     # Restore weight tying (e.g., lm_head shares weight with embed_tokens).
     # Meta-device loading breaks tied weights because each gets materialized
-    # independently. Re-tie them based on the model config.
-    if getattr(config, "tie_word_embeddings", True):
+    # independently. Re-tie them based on the model config. Only tie when the
+    # config says so explicitly — defaulting to tied would alias a real
+    # lm_head onto the embedding for models that omit the attribute.
+    if getattr(config, "tie_word_embeddings", False):
         _restore_weight_tying(model)
 
     if device != "cpu" and torch.cuda.is_available():

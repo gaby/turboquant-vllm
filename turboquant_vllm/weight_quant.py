@@ -622,7 +622,10 @@ class TurboQuantWrapper(nn.Module):
         # Triton kernels assume full-width WHT on input. CUDA kernels accept a
         # block_size parameter and handle both full-width and block-diagonal
         # rotations, so they aren't gated by this — see _forward_gpu.
-        return self.rotary_dim is None
+        # Learned rotations are arbitrary orthogonal matrices; neither the
+        # Triton nor the CUDA kernels can apply them, so those layers always
+        # dequantize through the reference path.
+        return self.rotary_dim is None and not self._has_learned_rotation
 
     def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
         """Fullgraph-dynamo-clean forward for GPU (Triton or CUDA backends).
@@ -643,6 +646,14 @@ class TurboQuantWrapper(nn.Module):
             args = (x, self.packed_weight, self.norms, self.tq_signs1, self.tq_signs2, self.tq_centroids)
             kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
+            # The dequant-GEMM kernel loads a full (GROUP_SIZE, GROUP_SIZE)
+            # fp32 rotation tile per program — 256 KB at group_size=256,
+            # beyond shared-memory limits, and Triton's OutOfResources is not
+            # caught by the fallback below. The FWHT-input kernel rotates
+            # outside the kernel, so it is the only Triton path there.
+            if self.group_size > 128:
+                return _tq_fwht_input_fn(*args, **kwargs)
+
             # FWHT-on-input wins for large output dims (saves N inverse rotations).
             # Dequant-GEMM wins for small layers (lower fixed overhead).
             # Crossover ~4K output features on H100.
@@ -659,6 +670,7 @@ class TurboQuantWrapper(nn.Module):
         if (
             _cuda_mod is not None
             and _tq_cuda_dequant_gemm_fn is not None
+            and not self._has_learned_rotation
             and self.group_size in _CUDA_KERNEL_GROUP_SIZES
         ):
             block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
@@ -688,13 +700,20 @@ class TurboQuantWrapper(nn.Module):
         """
         indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
         norms_flat = self.norms.reshape(-1)
-        quantizer = _get_quantizer(
-            self.group_size,
-            self.bits,
-            str(x.device),
-            rotary_dim=self.rotary_dim,
-        )
-        w_groups = quantizer.dequantize(indices, norms_flat)
+        if self._has_learned_rotation:
+            # Learned rotation (SpinQuant-style): the weight was rotated by
+            # the stored R at quantization time, so reconstruction must apply
+            # R as well — the shared quantizer would apply the fixed WHT.
+            y_hat = self.tq_centroids.to(torch.float32)[indices]
+            w_groups = (y_hat @ self.rotation.to(torch.float32)) * norms_flat.to(torch.float32).unsqueeze(1)
+        else:
+            quantizer = _get_quantizer(
+                self.group_size,
+                self.bits,
+                str(x.device),
+                rotary_dim=self.rotary_dim,
+            )
+            w_groups = quantizer.dequantize(indices, norms_flat)
         w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
         w_deq = w_deq.to(x.dtype)
         output = torch.matmul(x, w_deq.t())

@@ -30,12 +30,14 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
 
     AWQ layout (as expected by vLLM's AWQ kernels):
     - qweight: int32, shape (in_features, out_features // pack_factor)
-      Pack factor = 32 // bits. 8 4-bit values per int32.
+      Pack factor = 32 // bits. 8 4-bit values per int32, in AWQ's
+      interleaved order [0, 2, 4, 6, 1, 3, 5, 7] (nibble i of each int32
+      holds column ``block*pack_factor + order[i]``), matching
+      AutoAWQ/vLLM's awq_dequantize shuffle.
       Weight is TRANSPOSED from (out, in) to (in, out) before packing.
     - scales: float16, shape (in_features // group_size, out_features)
-    - qzeros: float16, shape (in_features // group_size, out_features)
-      Note: some AWQ implementations pack qzeros as int32 but vLLM's
-      awq_dequantize accepts float16 zeros as well.
+    - qzeros: int32, shape (in_features // group_size,
+      out_features // pack_factor), packed the same way as qweight.
 
     Args:
         weight: (out_features, in_features) float tensor.
@@ -80,17 +82,21 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
     # Reshape back to (padded_in, out_dim)
     w_int_flat = w_int.reshape(padded_in, out_dim)
 
-    # Pack into int32: pack_factor values per int32 along out_dim
+    # Pack into int32: pack_factor values per int32 along out_dim, using
+    # AWQ's interleaved column order ([0,2,4,6,1,3,5,7] for 4-bit) — the
+    # AWQ GEMM/dequant kernels reverse exactly this shuffle, so a linear
+    # 0..7 order would dequantize to a column-permuted weight.
     assert out_dim % pack_factor == 0, f"out_dim {out_dim} not divisible by pack_factor {pack_factor}"
+    awq_order = list(range(0, pack_factor, 2)) + list(range(1, pack_factor, 2))
     packed = torch.zeros(padded_in, out_dim // pack_factor, dtype=torch.int32, device=weight.device)
-    for i in range(pack_factor):
-        packed |= w_int_flat[:, i::pack_factor] << (i * bits)
+    for i, src in enumerate(awq_order):
+        packed |= w_int_flat[:, src::pack_factor] << (i * bits)
 
     # qzeros: pack the same way as qweight
     zeros_int = torch.round(zeros).clamp(0, max_val).to(torch.int32)
     qzeros = torch.zeros(n_groups, out_dim // pack_factor, dtype=torch.int32, device=weight.device)
-    for i in range(pack_factor):
-        qzeros |= zeros_int[:, i::pack_factor] << (i * bits)
+    for i, src in enumerate(awq_order):
+        qzeros |= zeros_int[:, src::pack_factor] << (i * bits)
 
     return packed, scales.to(torch.float16), qzeros
 

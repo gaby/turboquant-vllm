@@ -81,6 +81,7 @@ if LinearBase is not None:
             group_size: int = 128,
             sensitive_bits: int | None = None,
             native_packed: bool = False,
+            sensitive_patterns: "tuple[str, ...] | list[str] | None" = None,
         ):
             super().__init__()
             if bits not in (2, 3, 4):
@@ -95,9 +96,12 @@ if LinearBase is not None:
                 raise ValueError(f"turboquant group_size must be a power of two >= 8; got {group_size}")
             if sensitive_bits is not None and sensitive_bits not in (2, 3, 4):
                 raise ValueError(f"turboquant sensitive_bits must be 2, 3, or 4 or None; got {sensitive_bits}")
+            from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS
+
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
+            self.sensitive_patterns = tuple(sensitive_patterns) if sensitive_patterns else _SENSITIVE_PATTERNS
             self.native_packed = native_packed
             self._moe_scratch_pool = None
 
@@ -126,27 +130,41 @@ if LinearBase is not None:
             bits = cls.get_from_keys_or(config, ["bits"], 3)
             group_size = cls.get_from_keys_or(config, ["group_size"], 128)
             sensitive_bits = cls.get_from_keys_or(config, ["sensitive_bits"], None)
+            sensitive_patterns = cls.get_from_keys_or(config, ["sensitive_patterns"], None)
             native_packed = config.get("format") == "tq3_native"
             return cls(
                 bits=bits,
                 group_size=group_size,
                 sensitive_bits=sensitive_bits,
                 native_packed=native_packed,
+                sensitive_patterns=sensitive_patterns,
             )
+
+        def _bits_for(self, name: str) -> int:
+            from turboquant_vllm.weight_quant import select_bits
+
+            return select_bits(name, self.bits, self.sensitive_bits, self.sensitive_patterns)
 
         def get_quant_method(self, layer: nn.Module, prefix: str) -> "QuantizeMethodBase | None":
             if isinstance(layer, LinearBase):
-                return TurboQuantOnlineLinearMethod(self.bits, self.group_size)
+                return TurboQuantOnlineLinearMethod(self._bits_for(prefix), self.group_size)
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
 
                 if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
+                    # The fused MoE params don't carry per-projection names,
+                    # so match the patterns against synthetic proj names under
+                    # this prefix — the same substrings the checkpoint packer
+                    # saw in the per-expert on-disk names (e.g.
+                    # "…experts.5.down_proj.weight").
                     return TurboQuantOnlineMoEMethod(
                         self.bits,
                         self.group_size,
                         layer.moe_config,
                         native_packed=self.native_packed,
                         scratch_pool_owner=self,
+                        w13_bits=self._bits_for(f"{prefix}.gate_up_proj"),
+                        w2_bits=self._bits_for(f"{prefix}.down_proj"),
                     )
             except ImportError:
                 pass
@@ -806,11 +824,11 @@ def _finalize_native_packed_moe(
             delattr(layer, name)
         layer.register_parameter(name, real_param)
 
-    def _normalize_packed_layout(packed: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:
+    def _normalize_packed_layout(packed: torch.Tensor, shape: tuple[int, int, int], bits: int) -> torch.Tensor:
         n_experts, out_dim, in_dim = shape
         total_rows = n_experts * out_dim
         _, n_groups = padded_size(in_dim, method.group_size)
-        pgb = packed_group_bytes(method.bits, method.group_size)
+        pgb = packed_group_bytes(bits, method.group_size)
 
         if packed.ndim != 2:
             raise ValueError(f"Expected 2D packed tensor for shape {shape}, got {tuple(packed.shape)}")
@@ -849,28 +867,34 @@ def _finalize_native_packed_moe(
             group_size=w13.group_size,
         )
 
+    # Per-projection bit widths: sensitive_bits checkpoints pack w2
+    # (down_proj) at a different width than w13. Fall back to the uniform
+    # method.bits for methods that predate the split (e.g. test doubles).
+    w13_bits = getattr(method, "w13_bits", method.bits)
+    w2_bits = getattr(method, "w2_bits", method.bits)
+
     w13_packed = getattr(layer, "w13_weight_tq_packed").data
     w13_norms = getattr(layer, "w13_weight_tq_norms").data
     w13_shape = _resolve_native_moe_shape(
-        w13_packed, w13_norms, param_shapes["w13_weight"], method.bits, method.group_size
+        w13_packed, w13_norms, param_shapes["w13_weight"], w13_bits, method.group_size
     )
     w13_c = Compressed3D.from_packed(
-        _normalize_packed_layout(w13_packed, w13_shape),
+        _normalize_packed_layout(w13_packed, w13_shape, w13_bits),
         w13_norms,
         shape=w13_shape,
         dtype=param_dtypes["w13_weight"],
-        bits=method.bits,
+        bits=w13_bits,
         group_size=method.group_size,
     )
     w2_packed = getattr(layer, "w2_weight_tq_packed").data
     w2_norms = getattr(layer, "w2_weight_tq_norms").data
-    w2_shape = _resolve_native_moe_shape(w2_packed, w2_norms, param_shapes["w2_weight"], method.bits, method.group_size)
+    w2_shape = _resolve_native_moe_shape(w2_packed, w2_norms, param_shapes["w2_weight"], w2_bits, method.group_size)
     w2_c = Compressed3D.from_packed(
-        _normalize_packed_layout(w2_packed, w2_shape),
+        _normalize_packed_layout(w2_packed, w2_shape, w2_bits),
         w2_norms,
         shape=w2_shape,
         dtype=param_dtypes["w2_weight"],
-        bits=method.bits,
+        bits=w2_bits,
         group_size=method.group_size,
     )
     if _backend_name() == "FLASHINFER_TRTLLM":
@@ -986,9 +1010,15 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             moe_config: Any,
             native_packed: bool = False,
             scratch_pool_owner: Any | None = None,
+            w13_bits: int | None = None,
+            w2_bits: int | None = None,
         ):
             super().__init__(moe_config)
             self.bits = bits
+            # Per-projection bit widths: sensitive_bits configs pack w2
+            # (down_proj) at a different width than w13 (gate_up).
+            self.w13_bits = w13_bits if w13_bits is not None else bits
+            self.w2_bits = w2_bits if w2_bits is not None else bits
             self.group_size = group_size
             self.native_packed = native_packed
             self._scratch_pool_owner = scratch_pool_owner
@@ -1058,7 +1088,8 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 _, w2_out_dim, w2_in_dim = param_shapes["w2_weight"]
                 _, w13_groups = padded_size(w13_in_dim, self.group_size)
                 _, w2_groups = padded_size(w2_in_dim, self.group_size)
-                pgb = packed_group_bytes(self.bits, self.group_size)
+                w13_pgb = packed_group_bytes(self.w13_bits, self.group_size)
+                w2_pgb = packed_group_bytes(self.w2_bits, self.group_size)
                 native_required = set(_NATIVE_PACKED_PARAM_NAMES)
                 native_loaded: set[str] = set()
                 native_finalized = [False]
@@ -1103,7 +1134,7 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
                 _register_native_packed_param(
                     "w13_weight_tq_packed",
-                    (num_experts * w13_out_dim, w13_groups * pgb),
+                    (num_experts * w13_out_dim, w13_groups * w13_pgb),
                     torch.uint8,
                 )
                 _register_native_packed_param(
@@ -1113,7 +1144,7 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 )
                 _register_native_packed_param(
                     "w2_weight_tq_packed",
-                    (num_experts * w2_out_dim, w2_groups * pgb),
+                    (num_experts * w2_out_dim, w2_groups * w2_pgb),
                     torch.uint8,
                 )
                 _register_native_packed_param(
@@ -1207,8 +1238,8 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             if w13 is None or w2 is None or w13.dim() != 3 or w2.dim() != 3:
                 return
 
-            _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
-            _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
+            _compress_3d_param(layer, "w13_weight", self.w13_bits, self.group_size)
+            _compress_3d_param(layer, "w2_weight", self.w2_bits, self.group_size)
 
             self._w13_c = layer._tq_w13_weight
             self._w2_c = layer._tq_w2_weight
@@ -1654,10 +1685,20 @@ def _patch_weight_name_remapping():
 
         import json as _json
 
+        from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS, select_bits
+
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
+        # Sensitive tensors (o_proj/down_proj by default) are packed at
+        # sensitive_bits by save_tq3_checkpoint — decoding them at the
+        # uniform width reads the packed bytes with the wrong layout.
+        sensitive_bits = tq_cfg.get("sensitive_bits")
+        sensitive_patterns = tuple(tq_cfg.get("sensitive_patterns") or _SENSITIVE_PATTERNS)
+        # True in_dim for weights whose width was padded to a multiple of
+        # group_size at pack time (keyed by raw on-disk tensor name).
+        orig_in_dims = tq_cfg.get("orig_in_dims") or {}
         native_packed = tq_cfg.get("format") == "tq3_native"
         logger.info(
             "TQ3 native checkpoint (bits=%d, group_size=%d): single-pass decompress-on-load",
@@ -1741,10 +1782,14 @@ def _patch_weight_name_remapping():
                         yield out_name, out_tensor
                 continue
             elif name.endswith(".weight.tq_packed"):
-                base = name[: -len(".tq_packed")]
+                # Key (and later yield) by the RAW name: like the
+                # pass-through branch below, decompressed weights go through
+                # AutoWeightsLoader, which applies hf_to_vllm_mapper itself —
+                # yielding the mapped name here would map them twice.
+                base = raw_name[: -len(".tq_packed")]
                 pending_packed[base] = tensor
             elif name.endswith(".weight.tq_norms"):
-                base = name[: -len(".tq_norms")]
+                base = raw_name[: -len(".tq_norms")]
                 pending_norms[base] = tensor
             elif name.endswith(_FP8_LEFTOVER_SCALE_SUFFIXES):
                 skipped_fp8_scales += 1
@@ -1770,10 +1815,16 @@ def _patch_weight_name_remapping():
                     norms,
                     (1, n_rows, in_dim),
                     torch.bfloat16,
-                    bits,
+                    select_bits(base, bits, sensitive_bits, sensitive_patterns),
                     group_size,
                 )
                 w = comp.decompress().squeeze(0)
+                # n_groups only preserves the padded width; restore the true
+                # in_dim recorded at pack time (standalone loaders truncate
+                # against the model's param shapes instead).
+                true_in = orig_in_dims.get(base)
+                if true_in is not None and 0 < true_in < w.shape[1]:
+                    w = w[:, :true_in].contiguous()
                 decompressed += 1
                 if decompressed % 200 == 0:
                     logger.info("  Decompressed %d tensors", decompressed)

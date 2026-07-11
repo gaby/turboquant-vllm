@@ -151,8 +151,13 @@ class _SaliencyCollector:
         self._current_gate_values = gate_values.detach()
         self._current_top_k_indices = top_k_indices.detach()
 
-    def record_expert_activation(self, expert_idx: int, activation_norm: float, num_tokens: int):
-        """Called by expert hook."""
+    def record_expert_activation(self, expert_idx: int, token_norms: torch.Tensor, num_tokens: int):
+        """Called by expert hook.
+
+        ``token_norms`` holds the per-token L2 norms of this expert's output,
+        in routed-token order (the order MoE implementations dispatch tokens
+        to the expert, i.e. ascending token index).
+        """
         if self._current_gate_values is None:
             return
         # Find tokens where this expert was in top-k (vectorized)
@@ -161,9 +166,20 @@ class _SaliencyCollector:
         if active.any():
             # Sum gate values across all top-k slots where this expert appears
             gate_vals = (self._current_gate_values * expert_mask.float()).sum(dim=-1)  # (batch*seq,)
-            gate_sum = gate_vals[active].sum().item()
-            self.weighted_sum[expert_idx] += gate_sum * activation_norm / max(num_tokens, 1)
-            self.active_count[expert_idx] += active.sum().item()
+            n_active = int(active.sum().item())
+            token_norms = token_norms.to(self.weighted_sum.device)
+            if token_norms.numel() == n_active:
+                # REAP saliency: S_j = mean over active tokens of
+                # gate(x) · ‖expert_output(x)‖₂ — pair each routed token's
+                # gate value with ITS OWN output norm.
+                self.weighted_sum[expert_idx] += (gate_vals[active] * token_norms).sum().item()
+            else:
+                # Routed-token count doesn't line up with the gate mask (e.g.
+                # capacity dropping or an unexpected dispatch layout): fall
+                # back to the aggregate approximation.
+                gate_sum = gate_vals[active].sum().item()
+                self.weighted_sum[expert_idx] += gate_sum * token_norms.norm().item() / max(num_tokens, 1)
+            self.active_count[expert_idx] += n_active
 
     def compute_saliency(self) -> torch.Tensor:
         """Compute final saliency: weighted_sum / active_count."""
@@ -196,8 +212,8 @@ def _make_gate_hook(collector: _SaliencyCollector, top_k: int = 8):
         gate_values, top_k_indices = torch.topk(torch.softmax(logits, dim=-1), k=k, dim=-1)
         # Flatten batch and seq dimensions
         if gate_values.dim() > 2:
-            gate_values = gate_values.reshape(-1, top_k)
-            top_k_indices = top_k_indices.reshape(-1, top_k)
+            gate_values = gate_values.reshape(-1, k)
+            top_k_indices = top_k_indices.reshape(-1, k)
         collector.record_gate(gate_values, top_k_indices)
 
     return hook
@@ -211,10 +227,13 @@ def _make_expert_hook(collector: _SaliencyCollector, expert_idx: int):
             out = output[0]
         else:
             out = output
-        # Activation norm: L2 norm of the expert's output
-        norm = out.float().norm().item()
-        num_tokens = out.shape[0] if out.dim() >= 2 else 1
-        collector.record_expert_activation(expert_idx, norm, num_tokens)
+        # Per-token L2 norms of the expert's output, in routed-token order
+        if out.dim() >= 2:
+            token_norms = out.float().reshape(-1, out.shape[-1]).norm(dim=-1)
+        else:
+            token_norms = out.float().norm().reshape(1)
+        num_tokens = token_norms.numel()
+        collector.record_expert_activation(expert_idx, token_norms.detach(), num_tokens)
 
     return hook
 
@@ -315,12 +334,14 @@ def reap_prune(
                 prune_mask[idx] = True
 
             def _gate_mask_hook(module, input, output, mask=prune_mask):
+                # Router output may be (tokens, n_experts) or
+                # (batch, seq, n_experts) — mask the expert dim, not dim 1.
                 if isinstance(output, tuple):
                     logits = output[0]
-                    logits[:, mask] = float("-inf")
+                    logits[..., mask] = float("-inf")
                     return (logits,) + output[1:]
                 else:
-                    output[:, mask] = float("-inf")
+                    output[..., mask] = float("-inf")
                     return output
 
             gate.register_forward_hook(_gate_mask_hook)
