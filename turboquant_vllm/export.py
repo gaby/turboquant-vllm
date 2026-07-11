@@ -25,6 +25,16 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def awq_pack_order(pack_factor: int) -> list[int]:
+    """AWQ's interleaved packing order: [0, 2, 4, 6, 1, 3, 5, 7] for 4-bit.
+
+    Nibble ``i`` of each packed int32 holds column ``block * pack_factor +
+    order[i]``. AutoAWQ and vLLM's awq_dequantize reverse this exact
+    shuffle when unpacking.
+    """
+    return list(range(0, pack_factor, 2)) + list(range(1, pack_factor, 2))
+
+
 def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int = 4):
     """Compute AWQ-compatible scale, zero-point, and packed weight.
 
@@ -83,11 +93,11 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
     w_int_flat = w_int.reshape(padded_in, out_dim)
 
     # Pack into int32: pack_factor values per int32 along out_dim, using
-    # AWQ's interleaved column order ([0,2,4,6,1,3,5,7] for 4-bit) — the
-    # AWQ GEMM/dequant kernels reverse exactly this shuffle, so a linear
-    # 0..7 order would dequantize to a column-permuted weight.
+    # AWQ's interleaved column order — the AWQ GEMM/dequant kernels reverse
+    # exactly this shuffle, so a linear 0..7 order would dequantize to a
+    # column-permuted weight.
     assert out_dim % pack_factor == 0, f"out_dim {out_dim} not divisible by pack_factor {pack_factor}"
-    awq_order = list(range(0, pack_factor, 2)) + list(range(1, pack_factor, 2))
+    awq_order = awq_pack_order(pack_factor)
     packed = torch.zeros(padded_in, out_dim // pack_factor, dtype=torch.int32, device=weight.device)
     for i, src in enumerate(awq_order):
         packed |= w_int_flat[:, src::pack_factor] << (i * bits)

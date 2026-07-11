@@ -68,6 +68,13 @@ _NATIVE_PACKED_PARAM_NAMES = (
 )
 
 
+def _normalize_sensitive_patterns(patterns) -> "tuple[str, ...]":
+    """Module-level alias so config construction stays cloudpickle-safe."""
+    from turboquant_vllm.weight_quant import normalize_sensitive_patterns
+
+    return normalize_sensitive_patterns(patterns)
+
+
 # ── TurboQuantConfig: registered as `--quantization turboquant` ──
 
 if LinearBase is not None:
@@ -96,12 +103,10 @@ if LinearBase is not None:
                 raise ValueError(f"turboquant group_size must be a power of two >= 8; got {group_size}")
             if sensitive_bits is not None and sensitive_bits not in (2, 3, 4):
                 raise ValueError(f"turboquant sensitive_bits must be 2, 3, or 4 or None; got {sensitive_bits}")
-            from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS
-
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
-            self.sensitive_patterns = tuple(sensitive_patterns) if sensitive_patterns else _SENSITIVE_PATTERNS
+            self.sensitive_patterns = _normalize_sensitive_patterns(sensitive_patterns)
             self.native_packed = native_packed
             self._moe_scratch_pool = None
 
@@ -319,8 +324,10 @@ if LinearBase is not None:
             layer.tq_padded_in = padded_in
 
             if triton_ok and kernels_support_group:
-                layer._tq_primary_fn = wq._tq_fwht_input_fn if out_dim >= 4096 else wq._tq_fused_gemm_fn
-                layer._tq_fallback_fn = wq._tq_fused_gemm_fn if out_dim >= 4096 else wq._tq_fwht_input_fn
+                # Shared selector — encodes both the ~4K crossover and the
+                # group_size > 128 fused-GEMM exclusion (whose OutOfResources
+                # failure apply()'s fallback handler cannot catch).
+                layer._tq_primary_fn, layer._tq_fallback_fn = wq._select_triton_gemm_fns(out_dim, group_size)
             else:
                 layer._tq_primary_fn = None
             # Without Triton, prefer the CUDA dequant-GEMM extension over the
@@ -380,6 +387,13 @@ if LinearBase is not None:
                     layer.tq_signs2,
                     layer.tq_centroids,
                 )
+                if layer._tq_fallback_fn is None:
+                    return layer._tq_primary_fn(
+                        *args,
+                        group_size=self.group_size,
+                        bits=self.bits,
+                        bias=bias,
+                    )
                 try:
                     return layer._tq_primary_fn(
                         *args,
@@ -816,7 +830,12 @@ def _finalize_native_packed_moe(
         TurboQuantFusedMoEMethod,
         TurboQuantFusedMoEScratchPool,
     )
-    from turboquant_vllm.weight_quant import Compressed3D, packed_group_bytes, padded_size
+    from turboquant_vllm.weight_quant import (
+        Compressed3D,
+        bits_from_packed_group_bytes,
+        packed_group_bytes,
+        padded_size,
+    )
 
     def _bind_real_weight_param(name: str, tensor: torch.Tensor) -> None:
         real_param = torch.nn.Parameter(tensor, requires_grad=False)
@@ -867,36 +886,35 @@ def _finalize_native_packed_moe(
             group_size=w13.group_size,
         )
 
-    # Per-projection bit widths: sensitive_bits checkpoints pack w2
-    # (down_proj) at a different width than w13. Fall back to the uniform
-    # method.bits for methods that predate the split (e.g. test doubles).
-    w13_bits = getattr(method, "w13_bits", method.bits)
-    w2_bits = getattr(method, "w2_bits", method.bits)
+    def _load_projection(name: str) -> Compressed3D:
+        packed = getattr(layer, f"{name}_tq_packed").data
+        norms = getattr(layer, f"{name}_tq_norms").data
+        # Per-projection bit widths: sensitive_bits checkpoints pack w2
+        # (down_proj) at a different width than w13. The packed byte
+        # geometry is the ground truth — pgb = packed bytes / norms entries
+        # inverts packed_group_bytes bijectively over bits 2/3/4 — so the
+        # decode width cannot be desynced by config-side pattern matching
+        # (the method's w13_bits/w2_bits come from synthetic proj names,
+        # which mismatch checkpoints whose experts are named w1/w2/w3).
+        # Method attrs are only the fallback when geometry is unreadable,
+        # letting the shape validators raise their precise errors.
+        bits = getattr(method, f"{name[: -len('_weight')]}_bits", method.bits)
+        if norms.ndim == 2 and norms.numel() > 0 and packed.numel() % norms.numel() == 0:
+            derived = bits_from_packed_group_bytes(packed.numel() // norms.numel(), method.group_size)
+            if derived is not None:
+                bits = derived
+        shape = _resolve_native_moe_shape(packed, norms, param_shapes[name], bits, method.group_size)
+        return Compressed3D.from_packed(
+            _normalize_packed_layout(packed, shape, bits),
+            norms,
+            shape=shape,
+            dtype=param_dtypes[name],
+            bits=bits,
+            group_size=method.group_size,
+        )
 
-    w13_packed = getattr(layer, "w13_weight_tq_packed").data
-    w13_norms = getattr(layer, "w13_weight_tq_norms").data
-    w13_shape = _resolve_native_moe_shape(
-        w13_packed, w13_norms, param_shapes["w13_weight"], w13_bits, method.group_size
-    )
-    w13_c = Compressed3D.from_packed(
-        _normalize_packed_layout(w13_packed, w13_shape, w13_bits),
-        w13_norms,
-        shape=w13_shape,
-        dtype=param_dtypes["w13_weight"],
-        bits=w13_bits,
-        group_size=method.group_size,
-    )
-    w2_packed = getattr(layer, "w2_weight_tq_packed").data
-    w2_norms = getattr(layer, "w2_weight_tq_norms").data
-    w2_shape = _resolve_native_moe_shape(w2_packed, w2_norms, param_shapes["w2_weight"], w2_bits, method.group_size)
-    w2_c = Compressed3D.from_packed(
-        _normalize_packed_layout(w2_packed, w2_shape, w2_bits),
-        w2_norms,
-        shape=w2_shape,
-        dtype=param_dtypes["w2_weight"],
-        bits=w2_bits,
-        group_size=method.group_size,
-    )
+    w13_c = _load_projection("w13_weight")
+    w2_c = _load_projection("w2_weight")
     if _backend_name() == "FLASHINFER_TRTLLM":
         raise NotImplementedError(
             "TurboQuant native-packed MoE does not support FlashInfer TRTLLM's "
@@ -1685,7 +1703,7 @@ def _patch_weight_name_remapping():
 
         import json as _json
 
-        from turboquant_vllm.weight_quant import _SENSITIVE_PATTERNS, select_bits
+        from turboquant_vllm.weight_quant import select_bits
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
@@ -1695,7 +1713,7 @@ def _patch_weight_name_remapping():
         # sensitive_bits by save_tq3_checkpoint — decoding them at the
         # uniform width reads the packed bytes with the wrong layout.
         sensitive_bits = tq_cfg.get("sensitive_bits")
-        sensitive_patterns = tuple(tq_cfg.get("sensitive_patterns") or _SENSITIVE_PATTERNS)
+        sensitive_patterns = _normalize_sensitive_patterns(tq_cfg.get("sensitive_patterns"))
         # True in_dim for weights whose width was padded to a multiple of
         # group_size at pack time (keyed by raw on-disk tensor name).
         orig_in_dims = tq_cfg.get("orig_in_dims") or {}
@@ -1821,10 +1839,11 @@ def _patch_weight_name_remapping():
                 w = comp.decompress().squeeze(0)
                 # n_groups only preserves the padded width; restore the true
                 # in_dim recorded at pack time (standalone loaders truncate
-                # against the model's param shapes instead).
+                # against the model's param shapes instead). A strided view
+                # suffices — vLLM's weight loaders copy_ from the source.
                 true_in = orig_in_dims.get(base)
-                if true_in is not None and 0 < true_in < w.shape[1]:
-                    w = w[:, :true_in].contiguous()
+                if true_in is not None:
+                    w = w[:, :true_in]
                 decompressed += 1
                 if decompressed % 200 == 0:
                     logger.info("  Decompressed %d tensors", decompressed)

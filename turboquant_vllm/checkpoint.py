@@ -698,8 +698,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         Compressed3D,
         _register_moe_hooks,
         _get_quantizer,
+        normalize_sensitive_patterns,
         select_bits,
-        _SENSITIVE_PATTERNS,
     )
     import torch.nn as nn
 
@@ -708,7 +708,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
     sensitive_bits = tq_config.get("sensitive_bits")
-    sensitive_patterns = tuple(tq_config.get("sensitive_patterns", _SENSITIVE_PATTERNS))
+    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"))
 
     # Step 1: Create model on meta device (zero memory allocation)
     logger.info("Creating model skeleton on meta device...")
@@ -1123,8 +1123,11 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     # Meta-device loading breaks tied weights because each gets materialized
     # independently. Re-tie them based on the model config. Only tie when the
     # config says so explicitly — defaulting to tied would alias a real
-    # lm_head onto the embedding for models that omit the attribute.
-    if getattr(config, "tie_word_embeddings", False):
+    # lm_head onto the embedding for models that omit the attribute (HF v5's
+    # own tie decision reads getattr(..., False) the same way). Composite
+    # configs (VLMs) keep the flag on their text sub-config.
+    _tie_cfg = config.get_text_config(decoder=True) if hasattr(config, "get_text_config") else config
+    if getattr(_tie_cfg, "tie_word_embeddings", False):
         _restore_weight_tying(model)
 
     if device != "cpu" and torch.cuda.is_available():
@@ -1166,6 +1169,13 @@ def _restore_weight_tying(model):
         lm_head = getattr(model, "lm_head", None)
 
     if lm_head is not None and hasattr(lm_head, "weight"):
+        if lm_head.weight.shape != embed_weight.shape:
+            logger.warning(
+                "Not tying lm_head -> embed_tokens: shape mismatch %s vs %s",
+                tuple(lm_head.weight.shape),
+                tuple(embed_weight.shape),
+            )
+            return
         lm_head.weight = embed_weight
         logger.info("Restored weight tying: lm_head -> embed_tokens")
 

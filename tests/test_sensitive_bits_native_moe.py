@@ -91,9 +91,14 @@ class TestPerProjectionBits:
         assert layer._tq_w13_weight.bits == 3
         assert layer._tq_w2_weight.bits == 3
 
-    def test_wrong_uniform_bits_is_a_loud_error(self):
-        # Documents the pre-fix failure mode: decoding a 4-bit-packed w2 at
-        # the uniform 3 bits trips the packed-layout validation.
+    def test_packed_geometry_overrides_config_bits(self):
+        # Config-side bits come from pattern-matching synthetic proj names,
+        # which can disagree with checkpoints whose experts are named
+        # w1/w2/w3. The packed byte geometry is authoritative: a w2 packed
+        # at 4 bits decodes at 4 bits even when the method says 3.
         method = _fake_method(bits=3, w13_bits=3, w2_bits=3)
-        with pytest.raises(ValueError):
-            _finalize(3, 4, method)
+        layer, _, w2_data = _finalize(3, 4, method)
+        assert layer._tq_w13_weight.bits == 3
+        assert layer._tq_w2_weight.bits == 4
+        mse2 = ((layer._tq_w2_weight.decompress().float() - w2_data.float()) ** 2).mean().item()
+        assert mse2 < 0.05, f"w2 MSE {mse2:.4f} too high after geometry-derived decode"

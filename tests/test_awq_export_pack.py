@@ -10,9 +10,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from turboquant_vllm.export import _compute_awq_params  # noqa: E402
+from turboquant_vllm.export import _compute_awq_params, awq_pack_order  # noqa: E402
 
-AWQ_PACK_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]
+
+def test_awq_pack_order_matches_awq_reference():
+    # The canonical AWQ 4-bit shuffle, as hardcoded in AutoAWQ/vLLM kernels.
+    assert awq_pack_order(8) == [0, 2, 4, 6, 1, 3, 5, 7]
 
 
 def _awq_unpack(packed: torch.Tensor, bits: int = 4) -> torch.Tensor:
@@ -20,7 +23,7 @@ def _awq_unpack(packed: torch.Tensor, bits: int = 4) -> torch.Tensor:
     pack_factor = 32 // bits
     rows, packed_cols = packed.shape
     out = torch.zeros(rows, packed_cols * pack_factor, dtype=torch.int32)
-    for i, src in enumerate(AWQ_PACK_ORDER):
+    for i, src in enumerate(awq_pack_order(pack_factor)):
         out[:, src::pack_factor] = (packed >> (i * bits)) & ((1 << bits) - 1)
     return out
 

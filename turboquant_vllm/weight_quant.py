@@ -366,6 +366,47 @@ def packed_group_bytes(bits: int, group_size: int) -> int:
     return group_size
 
 
+def bits_from_packed_group_bytes(pgb: int, group_size: int) -> "int | None":
+    """Inverse of ``packed_group_bytes`` over the supported widths (2/3/4).
+
+    The mapping is bijective for a fixed group_size, so a packed tensor's
+    byte geometry recovers the bit width it was packed at — the ground
+    truth when config-side heuristics (e.g. sensitive-pattern matching on
+    synthetic names) could disagree with what a checkpoint actually stores.
+    Returns None when no supported width matches.
+    """
+    for bits in (2, 3, 4):
+        if packed_group_bytes(bits, group_size) == pgb:
+            return bits
+    return None
+
+
+def _select_triton_gemm_fns(out_features: int, group_size: int):
+    """Pick (primary, fallback) Triton launchers for a Linear layer.
+
+    Shared by TurboQuantWrapper._forward_gpu and the vLLM online linear
+    method so the kernel-capability policy lives in one place:
+
+    - The dequant-GEMM kernel loads a full (GROUP_SIZE, GROUP_SIZE) fp32
+      rotation tile per program — 256 KB at group_size=256, beyond
+      shared-memory limits, and Triton's OutOfResources is not caught by
+      the callers' ValueError/RuntimeError fallback. For group_size > 128
+      the FWHT-input kernel (which rotates outside the kernel) is the only
+      Triton path, signalled by a None fallback.
+    - Otherwise FWHT-on-input wins for large output dims (saves N inverse
+      rotations); dequant-GEMM wins for small layers (lower fixed
+      overhead). Crossover ~4K output features on H100.
+
+    Reads the lazily-populated module globals, so call only after
+    _ensure_triton_backends() has returned True.
+    """
+    if group_size > 128:
+        return _tq_fwht_input_fn, None
+    if out_features >= 4096:
+        return _tq_fwht_input_fn, _tq_fused_gemm_fn
+    return _tq_fused_gemm_fn, _tq_fwht_input_fn
+
+
 def padded_size(dim: int, group_size: int) -> tuple[int, int]:
     """Return ``(padded_dim, n_groups)`` for group quantization."""
     padded = ((dim + group_size - 1) // group_size) * group_size
@@ -646,19 +687,9 @@ class TurboQuantWrapper(nn.Module):
             args = (x, self.packed_weight, self.norms, self.tq_signs1, self.tq_signs2, self.tq_centroids)
             kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
-            # The dequant-GEMM kernel loads a full (GROUP_SIZE, GROUP_SIZE)
-            # fp32 rotation tile per program — 256 KB at group_size=256,
-            # beyond shared-memory limits, and Triton's OutOfResources is not
-            # caught by the fallback below. The FWHT-input kernel rotates
-            # outside the kernel, so it is the only Triton path there.
-            if self.group_size > 128:
-                return _tq_fwht_input_fn(*args, **kwargs)
-
-            # FWHT-on-input wins for large output dims (saves N inverse rotations).
-            # Dequant-GEMM wins for small layers (lower fixed overhead).
-            # Crossover ~4K output features on H100.
-            primary = _tq_fwht_input_fn if self.out_features >= 4096 else _tq_fused_gemm_fn
-            fallback = _tq_fused_gemm_fn if self.out_features >= 4096 else _tq_fwht_input_fn
+            primary, fallback = _select_triton_gemm_fns(self.out_features, self.group_size)
+            if fallback is None:
+                return primary(*args, **kwargs)
             try:
                 return primary(*args, **kwargs)
             except (ValueError, RuntimeError):
@@ -692,30 +723,41 @@ class TurboQuantWrapper(nn.Module):
         # PolarQuantTorch fallback — honors self.rotary_dim via _apply_wht.
         return self._forward_cpu(x)
 
-    def _forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        """PolarQuant reference dequant + matmul. Device-agnostic.
+    def dequantize_weight(self) -> torch.Tensor:
+        """Reconstruct the (out_features, in_features) weight in fp32.
 
-        Runs in eager mode only — the butterfly has a data-dependent while
-        loop that vLLM 0.19 fullgraph dynamo can't trace.
+        Owns the rotation-mode branches so every reconstruction site —
+        forward's reference path, sparse-outlier extraction — stays in sync
+        with how the weight was quantized:
+
+        - Learned rotation (SpinQuant-style): the weight was rotated by the
+          stored R at quantization time, so reconstruction must apply R as
+          well — the shared quantizer would apply the fixed WHT.
+        - Otherwise the cached PolarQuant quantizer, which honors
+          self.rotary_dim (block-diagonal WHT for partial-rotary layers).
         """
         indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
         norms_flat = self.norms.reshape(-1)
         if self._has_learned_rotation:
-            # Learned rotation (SpinQuant-style): the weight was rotated by
-            # the stored R at quantization time, so reconstruction must apply
-            # R as well — the shared quantizer would apply the fixed WHT.
             y_hat = self.tq_centroids.to(torch.float32)[indices]
             w_groups = (y_hat @ self.rotation.to(torch.float32)) * norms_flat.to(torch.float32).unsqueeze(1)
         else:
             quantizer = _get_quantizer(
                 self.group_size,
                 self.bits,
-                str(x.device),
+                str(self.packed_weight.device),
                 rotary_dim=self.rotary_dim,
             )
             w_groups = quantizer.dequantize(indices, norms_flat)
-        w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
-        w_deq = w_deq.to(x.dtype)
+        return w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
+
+    def _forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        """PolarQuant reference dequant + matmul. Device-agnostic.
+
+        Runs in eager mode only — the butterfly has a data-dependent while
+        loop that vLLM 0.19 fullgraph dynamo can't trace.
+        """
+        w_deq = self.dequantize_weight().to(x.dtype)
         output = torch.matmul(x, w_deq.t())
         if self.bias is not None:
             output = output + self.bias
@@ -767,6 +809,21 @@ def select_bits(
     if any(p in tensor_name for p in sensitive_patterns):
         return sensitive_bits
     return default_bits
+
+
+def normalize_sensitive_patterns(patterns) -> tuple[str, ...]:
+    """Normalize a config-supplied sensitive_patterns value.
+
+    None (absent) falls back to the defaults. An explicit empty list is
+    honored as "no sensitive layers". A bare string becomes a single
+    pattern — tuple("down_proj") would explode it into nine one-character
+    patterns that substring-match nearly every tensor name.
+    """
+    if patterns is None:
+        return _SENSITIVE_PATTERNS
+    if isinstance(patterns, str):
+        return (patterns,)
+    return tuple(patterns)
 
 
 class Compressed3D:

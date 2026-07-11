@@ -644,10 +644,13 @@ def tq3_gemv_bs1_mlx_v2(
     OC = norms.shape[0]
     n_groups = norms.shape[1]
     assert OC % 8 == 0, f"v2 kernel requires OC % 8 == 0, got OC={OC}"
-    assert n_groups % 4 == 0, (
-        f"v2 kernel requires n_groups % 4 == 0 (K % 512 == 0), got n_groups={n_groups}; "
-        "use tq3_gemv_bs1_mlx (v1) for other shapes"
-    )
+    if n_groups % 4 != 0:
+        # A real raise, not an assert: under python -O the kernel would
+        # silently drop the tail groups from every dot product.
+        raise ValueError(
+            f"v2 kernel requires n_groups % 4 == 0 (K % 512 == 0), got n_groups={n_groups}; "
+            "use tq3_gemv_bs1_mlx (v1) for other shapes"
+        )
     assert x_rot.size == n_groups * 128
     assert packed.shape[0] == OC * n_groups
 
