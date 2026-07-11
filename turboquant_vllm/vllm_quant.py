@@ -1636,6 +1636,19 @@ def _maybe_flush_native_moe_target(
         parts = expert_map[idx]
         packed_parts = [parts[o][0] for o in sorted(required_orders)]
         norm_parts = [parts[o][1] for o in sorted(required_orders)]
+        widths = {p.shape[-1] for p in packed_parts}
+        if len(widths) > 1:
+            # A fused w13 target stores gate and up as one packed tensor, so
+            # both halves must share one bit width. Mixed widths (e.g. a
+            # custom sensitive_patterns entry matching only up_proj at save
+            # time) would otherwise die in torch.cat with an error naming no
+            # tensor.
+            raise ValueError(
+                f"Native MoE regroup for {target_key}: expert {idx} projection halves "
+                f"have mismatched packed widths {sorted(widths)}. Gate/up (w1/w3) must be "
+                "packed at the same bit width — sensitive_patterns matching only one half "
+                "of a fused projection cannot be represented in the fused layout."
+            )
         all_packed.append(torch.cat(packed_parts, dim=0) if len(packed_parts) > 1 else packed_parts[0])
         all_norms.append(torch.cat(norm_parts, dim=0) if len(norm_parts) > 1 else norm_parts[0])
 
@@ -1757,7 +1770,12 @@ def _patch_weight_name_remapping():
             name = _map(raw_name)
             if name is None:
                 continue
-            if name.endswith(".tq_packed") and ".experts." in name:
+            # The regroup interception only applies to native-packed MoE
+            # checkpoints (meta placeholder params exist). Without that
+            # format, a regroup lookup can never succeed — the pairs would
+            # be popped and silently dropped — so per-expert tensors fall
+            # through to the dense decompress branch instead.
+            if native_packed and name.endswith(".tq_packed") and ".experts." in name:
                 seen_native_moe_disk += 1
                 base = name[: -len(".tq_packed")]
                 pre_fused = _try_pre_fused_rename(base)
@@ -1778,7 +1796,7 @@ def _patch_weight_name_remapping():
                         yielded_native_moe += 1
                         yield out_name, out_tensor
                 continue
-            elif name.endswith(".tq_norms") and ".experts." in name:
+            elif native_packed and name.endswith(".tq_norms") and ".experts." in name:
                 seen_native_moe_disk += 1
                 base = name[: -len(".tq_norms")]
                 pre_fused = _try_pre_fused_rename(base)

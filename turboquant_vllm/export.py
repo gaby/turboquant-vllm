@@ -59,16 +59,19 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
     """
     out_dim, in_dim = weight.shape
     pack_factor = 32 // bits
-    n_groups = (in_dim + group_size - 1) // group_size
     max_val = (1 << bits) - 1
 
-    # Pad in_features to multiple of group_size
-    padded_in = n_groups * group_size
-    if padded_in > in_dim:
-        w = torch.zeros(out_dim, padded_in, dtype=weight.dtype, device=weight.device)
-        w[:, :in_dim] = weight
-    else:
-        w = weight
+    # AWQ's layout derives every shape from the model config's in_features
+    # (qweight rows, scales/qzeros group rows) and has no way to mark
+    # padding, so a padded export would not load back. Refuse loudly.
+    if in_dim % group_size != 0:
+        raise NotImplementedError(
+            f"AWQ export requires in_features divisible by group_size ({group_size}); "
+            f"got in_features={in_dim}. This layer cannot be represented in AWQ format."
+        )
+    n_groups = in_dim // group_size
+    padded_in = in_dim
+    w = weight
 
     # Transpose to (in_features, out_features) for AWQ layout
     w_t = w.t().contiguous()  # (padded_in, out_dim)

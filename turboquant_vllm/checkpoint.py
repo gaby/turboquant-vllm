@@ -929,8 +929,9 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 norms_data = loaded[base_name + ".tq_norms"]
                 from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
 
-                q = _get_quantizer(group_size, bits, str(packed.device))
-                indices = unpack_indices(packed, bits, group_size)
+                tensor_bits = select_bits(base_name, bits, sensitive_bits, sensitive_patterns)
+                q = _get_quantizer(group_size, tensor_bits, str(packed.device))
+                indices = unpack_indices(packed, tensor_bits, group_size)
                 norms_flat = norms_data.reshape(-1)
                 w_groups = q.dequantize(indices, norms_flat)
                 out_features, in_features = meta_param.shape
