@@ -68,11 +68,11 @@ _NATIVE_PACKED_PARAM_NAMES = (
 )
 
 
-def _normalize_sensitive_patterns(patterns) -> "tuple[str, ...]":
+def _normalize_sensitive_patterns(patterns, sensitive_bits: "int | None" = None) -> "tuple[str, ...]":
     """Module-level alias so config construction stays cloudpickle-safe."""
     from turboquant_vllm.weight_quant import normalize_sensitive_patterns
 
-    return normalize_sensitive_patterns(patterns)
+    return normalize_sensitive_patterns(patterns, sensitive_bits)
 
 
 # ── TurboQuantConfig: registered as `--quantization turboquant` ──
@@ -106,7 +106,7 @@ if LinearBase is not None:
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
-            self.sensitive_patterns = _normalize_sensitive_patterns(sensitive_patterns)
+            self.sensitive_patterns = _normalize_sensitive_patterns(sensitive_patterns, sensitive_bits)
             self.native_packed = native_packed
             self._moe_scratch_pool = None
 
@@ -1774,7 +1774,7 @@ def _patch_weight_name_remapping():
         # sensitive_bits by save_tq3_checkpoint — decoding them at the
         # uniform width reads the packed bytes with the wrong layout.
         sensitive_bits = tq_cfg.get("sensitive_bits")
-        sensitive_patterns = _normalize_sensitive_patterns(tq_cfg.get("sensitive_patterns"))
+        sensitive_patterns = _normalize_sensitive_patterns(tq_cfg.get("sensitive_patterns"), sensitive_bits)
         # True in_dim for weights whose width was padded to a multiple of
         # group_size at pack time (keyed by raw on-disk tensor name).
         orig_in_dims = tq_cfg.get("orig_in_dims") or {}
