@@ -418,6 +418,11 @@ def save_tq3_checkpoint(
     total_original = 0
     total_compressed = 0
     compressed_count = 0
+    # True (pre-padding) in_dim for compressed weights whose last dim is not
+    # a multiple of group_size. The packed format only preserves the padded
+    # width, so loaders need this to truncate back (see tq_config.json's
+    # "orig_in_dims").
+    orig_in_dims: dict[str, int] = {}
 
     def _flush_shard():
         nonlocal current_shard, current_shard_bytes, shard_idx
@@ -492,6 +497,8 @@ def save_tq3_checkpoint(
                     packed, norms = _compress_tensor(tensor, tensor_quantizer, tensor_bits, group_size)
                     _add_tensor(tensor_name + ".tq_packed", packed)
                     _add_tensor(tensor_name + ".tq_norms", norms)
+                    if tensor.shape[-1] % group_size != 0:
+                        orig_in_dims[tensor_name] = int(tensor.shape[-1])
 
                     comp_bytes = packed.numel() + norms.numel() * norms.element_size()
                     total_compressed += comp_bytes
@@ -561,6 +568,8 @@ def save_tq3_checkpoint(
     if sensitive_bits is not None:
         tq_config["sensitive_bits"] = sensitive_bits
         tq_config["sensitive_patterns"] = list(_SENSITIVE_PATTERNS)
+    if orig_in_dims:
+        tq_config["orig_in_dims"] = orig_in_dims
     with open(os.path.join(output_dir, "tq_config.json"), "w") as f:
         json.dump(tq_config, f, indent=2)
 
@@ -689,8 +698,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         Compressed3D,
         _register_moe_hooks,
         _get_quantizer,
+        normalize_sensitive_patterns,
         select_bits,
-        _SENSITIVE_PATTERNS,
     )
     import torch.nn as nn
 
@@ -699,7 +708,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
     sensitive_bits = tq_config.get("sensitive_bits")
-    sensitive_patterns = tuple(tq_config.get("sensitive_patterns", _SENSITIVE_PATTERNS))
+    sensitive_patterns = normalize_sensitive_patterns(tq_config.get("sensitive_patterns"), sensitive_bits)
 
     # Step 1: Create model on meta device (zero memory allocation)
     logger.info("Creating model skeleton on meta device...")
@@ -920,8 +929,9 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 norms_data = loaded[base_name + ".tq_norms"]
                 from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
 
-                q = _get_quantizer(group_size, bits, str(packed.device))
-                indices = unpack_indices(packed, bits, group_size)
+                tensor_bits = select_bits(base_name, bits, sensitive_bits, sensitive_patterns)
+                q = _get_quantizer(group_size, tensor_bits, str(packed.device))
+                indices = unpack_indices(packed, tensor_bits, group_size)
                 norms_flat = norms_data.reshape(-1)
                 w_groups = q.dequantize(indices, norms_flat)
                 out_features, in_features = meta_param.shape
@@ -1003,14 +1013,32 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 )
                 continue
 
-            # Stack: concat fused parts per expert, then cat across experts
+            # Stack: concat fused parts per expert, then cat across experts.
+            # One fused target stores everything at one bit width, so any
+            # packed-width mismatch (custom sensitive_patterns matching only
+            # one half or a subset of experts) must fail with a named error
+            # rather than torch.cat's anonymous size mismatch.
             all_packed = []
             all_norms = []
             for eidx in sorted(expert_data.keys()):
                 pks, nks = expert_data[eidx]
+                widths = {p.shape[-1] for p in pks}
+                if len(widths) > 1:
+                    raise ValueError(
+                        f"Native MoE regroup for {target_key}: expert {eidx} projection halves "
+                        f"have mismatched packed widths {sorted(widths)} — gate/up must be "
+                        "packed at the same bit width."
+                    )
                 all_packed.append(torch.cat(pks, dim=0) if len(pks) > 1 else pks[0])
                 all_norms.append(torch.cat(nks, dim=0) if len(nks) > 1 else nks[0])
 
+            expert_widths = {t.shape[-1] for t in all_packed}
+            if len(expert_widths) > 1:
+                raise ValueError(
+                    f"Native MoE regroup for {target_key}: experts have mismatched packed "
+                    f"widths {sorted(expert_widths)} — all experts of a fused projection "
+                    "must be packed at the same bit width."
+                )
             stacked_packed = torch.cat(all_packed, dim=0)
             stacked_norms = torch.cat(all_norms, dim=0)
 
@@ -1112,8 +1140,13 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
 
     # Restore weight tying (e.g., lm_head shares weight with embed_tokens).
     # Meta-device loading breaks tied weights because each gets materialized
-    # independently. Re-tie them based on the model config.
-    if getattr(config, "tie_word_embeddings", True):
+    # independently. Re-tie them based on the model config. Only tie when the
+    # config says so explicitly — defaulting to tied would alias a real
+    # lm_head onto the embedding for models that omit the attribute (HF v5's
+    # own tie decision reads getattr(..., False) the same way). Composite
+    # configs (VLMs) keep the flag on their text sub-config.
+    _tie_cfg = config.get_text_config(decoder=True) if hasattr(config, "get_text_config") else config
+    if getattr(_tie_cfg, "tie_word_embeddings", False):
         _restore_weight_tying(model)
 
     if device != "cpu" and torch.cuda.is_available():
@@ -1155,6 +1188,13 @@ def _restore_weight_tying(model):
         lm_head = getattr(model, "lm_head", None)
 
     if lm_head is not None and hasattr(lm_head, "weight"):
+        if lm_head.weight.shape != embed_weight.shape:
+            logger.warning(
+                "Not tying lm_head -> embed_tokens: shape mismatch %s vs %s",
+                tuple(lm_head.weight.shape),
+                tuple(embed_weight.shape),
+            )
+            return
         lm_head.weight = embed_weight
         logger.info("Restored weight tying: lm_head -> embed_tokens")
 

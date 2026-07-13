@@ -627,7 +627,10 @@ def tq3_gemv_bs1_mlx_v2(
 ) -> mx.array:
     """Register-pattern bs=1 GEMV — port of MLX's qmv_fast_impl shape.
 
-    Requires ``OC % 8 == 0`` (8 outputs per threadgroup, 4 per simdgroup).
+    Requires ``OC % 8 == 0`` (8 outputs per threadgroup, 4 per simdgroup)
+    and ``n_groups % 4 == 0`` (i.e. ``K % 512 == 0``): the kernel's main
+    loop walks K in 512-weight blocks with no remainder handling, so tail
+    groups would be silently dropped from the dot product.
     Takes the same row-major packed layout ``(OC * n_groups, 48)`` that
     the v1 kernel uses — repacking happens implicitly via pointer math
     (each output row of 48*n_groups bytes is contiguous, which is what
@@ -641,6 +644,13 @@ def tq3_gemv_bs1_mlx_v2(
     OC = norms.shape[0]
     n_groups = norms.shape[1]
     assert OC % 8 == 0, f"v2 kernel requires OC % 8 == 0, got OC={OC}"
+    if n_groups % 4 != 0:
+        # A real raise, not an assert: under python -O the kernel would
+        # silently drop the tail groups from every dot product.
+        raise ValueError(
+            f"v2 kernel requires n_groups % 4 == 0 (K % 512 == 0), got n_groups={n_groups}; "
+            "use tq3_gemv_bs1_mlx (v1) for other shapes"
+        )
     assert x_rot.size == n_groups * 128
     assert packed.shape[0] == OC * n_groups
 

@@ -46,7 +46,7 @@ def _reference_gemm(x, packed, norms_2d, quantizer, bits, group_size, out_dim, i
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(_skip_if_no_triton(), reason="Triton required")
 class TestTritonFusedGemm:
-    @pytest.mark.parametrize("bits", [4])
+    @pytest.mark.parametrize("bits", [3, 4])
     @pytest.mark.parametrize("M", [1, 16, 64])
     def test_correctness(self, bits, M):
         """Fused kernel output matches reference dequant + matmul."""

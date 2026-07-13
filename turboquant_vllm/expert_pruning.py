@@ -151,19 +151,43 @@ class _SaliencyCollector:
         self._current_gate_values = gate_values.detach()
         self._current_top_k_indices = top_k_indices.detach()
 
-    def record_expert_activation(self, expert_idx: int, activation_norm: float, num_tokens: int):
-        """Called by expert hook."""
+    def record_expert_activation(self, expert_idx: int, token_norms: torch.Tensor):
+        """Called by expert hook.
+
+        ``token_norms`` holds the per-token L2 norms of this expert's output
+        in the expert's dispatch order. HF Mixtral-style MoE blocks route via
+        ``torch.where(one_hot(top_k_index).permute(2, 1, 0)[expert_idx])``,
+        which enumerates SLOT-MAJOR: all slot-0 tokens (ascending), then all
+        slot-1 tokens, ... — NOT ascending token order.
+        """
         if self._current_gate_values is None:
             return
-        # Find tokens where this expert was in top-k (vectorized)
         expert_mask = self._current_top_k_indices == expert_idx  # (batch*seq, top_k)
         active = expert_mask.any(dim=-1)  # (batch*seq,)
-        if active.any():
-            # Sum gate values across all top-k slots where this expert appears
-            gate_vals = (self._current_gate_values * expert_mask.float()).sum(dim=-1)  # (batch*seq,)
+        if not active.any():
+            return
+        n_active = int(active.sum().item())
+        n_slots = int(expert_mask.sum().item())  # == n_active unless a router repeats an expert
+        # Gate tensors live on the gate module's device (which can differ from
+        # the collector's on sharded models); the products reduce to a Python
+        # float before touching weighted_sum, so match the gate device.
+        token_norms = token_norms.to(self._current_gate_values.device)
+        if token_norms.numel() == n_slots:
+            # REAP saliency: S_j = mean over active tokens of
+            # gate(x) · ‖expert_output(x)‖₂ — pair each routed row's gate
+            # value with ITS OWN output norm. Boolean-indexing the transposed
+            # (top_k, tokens) tensors enumerates row-major over (slot, token),
+            # exactly the torch.where dispatch order above.
+            gates_slot_major = self._current_gate_values.t()[expert_mask.t()]
+            self.weighted_sum[expert_idx] += (gates_slot_major * token_norms).sum().item()
+        else:
+            # Routed-row count doesn't line up with the gate mask (e.g.
+            # capacity dropping or an unexpected dispatch layout): fall back
+            # to the aggregate approximation.
+            gate_vals = (self._current_gate_values * expert_mask.float()).sum(dim=-1)
             gate_sum = gate_vals[active].sum().item()
-            self.weighted_sum[expert_idx] += gate_sum * activation_norm / max(num_tokens, 1)
-            self.active_count[expert_idx] += active.sum().item()
+            self.weighted_sum[expert_idx] += gate_sum * token_norms.norm().item() / max(token_norms.numel(), 1)
+        self.active_count[expert_idx] += n_active
 
     def compute_saliency(self) -> torch.Tensor:
         """Compute final saliency: weighted_sum / active_count."""
@@ -196,8 +220,8 @@ def _make_gate_hook(collector: _SaliencyCollector, top_k: int = 8):
         gate_values, top_k_indices = torch.topk(torch.softmax(logits, dim=-1), k=k, dim=-1)
         # Flatten batch and seq dimensions
         if gate_values.dim() > 2:
-            gate_values = gate_values.reshape(-1, top_k)
-            top_k_indices = top_k_indices.reshape(-1, top_k)
+            gate_values = gate_values.reshape(-1, k)
+            top_k_indices = top_k_indices.reshape(-1, k)
         collector.record_gate(gate_values, top_k_indices)
 
     return hook
@@ -211,10 +235,12 @@ def _make_expert_hook(collector: _SaliencyCollector, expert_idx: int):
             out = output[0]
         else:
             out = output
-        # Activation norm: L2 norm of the expert's output
-        norm = out.float().norm().item()
-        num_tokens = out.shape[0] if out.dim() >= 2 else 1
-        collector.record_expert_activation(expert_idx, norm, num_tokens)
+        # Per-token L2 norms of the expert's output, in dispatch order
+        if out.dim() >= 2:
+            token_norms = out.float().reshape(-1, out.shape[-1]).norm(dim=-1)
+        else:
+            token_norms = out.float().norm().reshape(1)
+        collector.record_expert_activation(expert_idx, token_norms.detach())
 
     return hook
 
@@ -315,12 +341,14 @@ def reap_prune(
                 prune_mask[idx] = True
 
             def _gate_mask_hook(module, input, output, mask=prune_mask):
+                # Router output may be (tokens, n_experts) or
+                # (batch, seq, n_experts) — mask the expert dim, not dim 1.
                 if isinstance(output, tuple):
                     logits = output[0]
-                    logits[:, mask] = float("-inf")
+                    logits[..., mask] = float("-inf")
                     return (logits,) + output[1:]
                 else:
-                    output[:, mask] = float("-inf")
+                    output[..., mask] = float("-inf")
                     return output
 
             gate.register_forward_hook(_gate_mask_hook)
@@ -596,14 +624,11 @@ def extract_sparse_outliers(
         if h_diag is None:
             continue
 
-        # Reconstruct the weight to compute error
-        from turboquant_vllm.weight_quant import unpack_indices, _get_quantizer
-
-        quantizer = _get_quantizer(module.group_size, module.bits, str(module.packed_weight.device))
-        indices = unpack_indices(module.packed_weight, module.bits, module.group_size)
-        norms_flat = module.norms.reshape(-1)
-        w_hat = quantizer.dequantize(indices, norms_flat)
-        w_hat = w_hat.reshape(module.out_features, module.padded_in)[:, : module.in_features]
+        # Reconstruct the weight to compute error. dequantize_weight owns the
+        # rotation-mode branches (learned R, block-diagonal WHT) — inlining
+        # the WHT quantizer here reconstructed learned-rotation wrappers with
+        # the wrong rotation and produced garbage outliers.
+        w_hat = module.dequantize_weight()
 
         # We don't have the original weight anymore, but we can use w_hat
         # and focus on high-Hessian positions where even small errors matter.

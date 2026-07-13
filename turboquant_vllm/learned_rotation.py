@@ -255,8 +255,8 @@ def quantize_with_learned_rotation(
     # Pack
     packed = pack_indices(indices, bits)
 
-    # Store norms as FP16 (saves 50% vs FP32, negligible quality impact)
-    norms_fp16 = corrected_norms.half()
-
+    # Keep norms in FP32 to match the standard WHT path — TurboQuantWrapper
+    # stores whatever dtype arrives here, and downstream dequant assumes the
+    # same precision for both rotation modes.
     n_groups = padded_in // group_size
-    return packed, norms_fp16.reshape(out_dim, n_groups), rotation
+    return packed, corrected_norms.float().reshape(out_dim, n_groups), rotation
