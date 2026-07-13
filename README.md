@@ -311,7 +311,7 @@ The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2
 
 Two independent implementations of the same algorithm exist, with different trade-offs:
 
-- **This plugin (`pip install turboquant-plus-vllm`)** — monkey-patches vLLM at import time via the `vllm.general_plugins` entry point. Works with any stable vLLM release, includes the CUDA bs=1 fused-dequant kernel, and the MoE path via `FusedMoE._replace_quant_method`. Enabled through the `TQ_WEIGHT_BITS` env var; fully standalone.
+- **This plugin (`pip install turboquant-plus-vllm`)** — monkey-patches vLLM at import time via the `vllm.general_plugins` entry point. Validated on vLLM 0.19–0.20 and, as of **v0.13.10**, vLLM 0.25.x (GPU-verified: `TQ_WEIGHT_BITS=3` Linear compression starts and decodes in eager + CUDA-graphs mode). On vLLM 0.25.x, online *MoE* weight compression is currently skipped — vLLM no longer exports `FusedMoE` as a plain class, so the `_replace_quant_method` sweep can't match it; dense models and native-packed MoE checkpoints are unaffected. Includes the CUDA bs=1 fused-dequant kernel; enabled through the `TQ_WEIGHT_BITS` env var; fully standalone.
 - **Upstream `--quantization turboquant`** ([vLLM PR #39970](https://github.com/vllm-project/vllm/pull/39970) + the MoE follow-up) — native vLLM scheme. Same algorithm, routed through `OnlineQuantizationConfig`. Not yet merged. When it lands you get `vllm serve <model> --quantization turboquant` without any plugin install, at the cost of tracking vLLM versions.
 
 The **upstream MoE path requires forcing the Triton MoE backend** (FlashInfer-CUTLASS and AITER permute expert weight storage during setup, which breaks the shared scratch-pool invariant both paths rely on):
