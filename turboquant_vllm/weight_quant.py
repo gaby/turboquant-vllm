@@ -1271,6 +1271,28 @@ def _prune_expert_weights(
     param[~keep_mask] = 0.0
 
 
+def _moe_module_types() -> tuple:
+    """MoE module classes to match across vLLM versions.
+
+    vLLM <= 0.20 exports ``FusedMoE`` as the ``nn.Module`` class. vLLM 0.25 made
+    ``FusedMoE`` a factory *function*; the module that owns the expert weights
+    (``w13_weight`` / ``w2_weight``, ``moe_config``, ``quant_method``,
+    ``_replace_quant_method``) is ``RoutedExperts`` (and ``MoERunner._quant_method``
+    reads ``routed_experts.quant_method`` live, so swapping it takes effect).
+    Return whichever are real classes so ``isinstance`` matches the right module.
+    """
+    try:
+        from vllm.model_executor.layers import fused_moe as _fm
+    except Exception:
+        return ()
+    types: list = []
+    for name in ("FusedMoE", "RoutedExperts"):
+        obj = getattr(_fm, name, None)
+        if isinstance(obj, type):  # 0.25's FusedMoE is a function → excluded
+            types.append(obj)
+    return tuple(types)
+
+
 def _replace_linear_layers(
     model: nn.Module,
     bits: int,
@@ -1457,31 +1479,24 @@ def _replace_linear_layers(
     # all FusedMoE layers — per-layer scratch would hold N × uncompressed
     # expert bytes on the side and wipe the compression savings.
     try:
-        from vllm.model_executor.layers.fused_moe import FusedMoE
-
         from turboquant_vllm.moe_quant import (
             TurboQuantFusedMoEMethod,
             TurboQuantFusedMoEScratchPool,
         )
     except ImportError:
-        FusedMoE = None
         TurboQuantFusedMoEMethod = None
         TurboQuantFusedMoEScratchPool = None
 
     moe_scratch_pool = None
+    # vLLM <= 0.20: FusedMoE is the module class. vLLM 0.25: FusedMoE is a
+    # factory function and RoutedExperts is the expert-weight module. Match
+    # whichever real class(es) exist (see _moe_module_types). Empty on vLLM-less
+    # or KV-only setups, which skips the block entirely.
+    moe_types = _moe_module_types()
 
-    # `isinstance(FusedMoE, type)`, not `is not None`: vLLM 0.25.0 exports
-    # FusedMoE as a non-None, non-class object (lazy proxy / moved export), so a
-    # `None` check passes but `isinstance(module, FusedMoE)` below raises
-    # `TypeError: isinstance() arg 2 must be a type`, breaking engine init for
-    # the TQ_WEIGHT_BITS online path (even on dense models).
-    if (
-        isinstance(FusedMoE, type)
-        and TurboQuantFusedMoEMethod is not None
-        and TurboQuantFusedMoEScratchPool is not None
-    ):
+    if moe_types and TurboQuantFusedMoEMethod is not None and TurboQuantFusedMoEScratchPool is not None:
         for name, module in list(model.named_modules()):
-            if not isinstance(module, FusedMoE):
+            if not isinstance(module, moe_types):
                 continue
             if any(p in name.lower() for p in _SKIP_PATTERNS):
                 continue
@@ -1577,11 +1592,11 @@ def _replace_linear_layers(
 
         owner, param_name = _resolve_parent_and_attr(model, name)
 
-        # Skip params that live inside a FusedMoE we already handled
-        # in Phase 2A. _compress_3d_param resets param.data to an empty
-        # tensor, so those params now have numel 0 and would fail the
-        # downstream pipeline anyway.
-        if isinstance(FusedMoE, type) and isinstance(owner, FusedMoE):
+        # Skip params that live inside a MoE module we already handled in
+        # Phase 2A (FusedMoE class on <=0.20, RoutedExperts on 0.25).
+        # _compress_3d_param resets param.data to an empty tensor, so those
+        # params now have numel 0 and would fail the downstream pipeline anyway.
+        if moe_types and isinstance(owner, moe_types):
             continue
 
         # Apply expert pruning in-place if mask available
