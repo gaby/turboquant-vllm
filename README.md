@@ -15,9 +15,9 @@ Model compression for vLLM. What this package ships today:
 - **AWQ export** from TQ-compressed dense weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
 
-> **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is now upstream in vLLM via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 (merged 2026-04-15). Use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path.
+> **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is now upstream in vLLM via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 (merged 2026-04-15). Use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path. Note the name overlap: the `turboquant_*` KV dtypes are that upstream KV backend, while this package's weight path is a different algorithm (scalar HIGGS, see "How it works"), so throughput numbers for one do not transfer to the other.
 
-> **Weight compression is also going upstream**: [vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970) adds the Linear-only weight-compression path as `--quantization turboquant` (scalar HIGGS). Opened 2026-04-16, awaiting maintainer triage. Once merged, upstream vLLM will have the weight path; MoE compression stays here until the follow-up upstream PR lands.
+> **Upstream weight compression: not merged, direction changed (status 2026-09-19).** [vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970) proposed this path as `--quantization turboquant` (scalar HIGGS). It was closed by its author on 2026-07-24, once vLLM's in-tree `humming` online-quantization framework became the natural home for Hadamard-plus-grid weight quantization. The follow-up adding the Hadamard transform to humming, [#42997](https://github.com/vllm-project/vllm/pull/42997), was closed on 2026-09-14 in favour of [#56685](https://github.com/vllm-project/vllm/pull/56685) (Humming feature integration), which is still open. Until that lands, this plugin is the way to run TQ3 weights on vLLM. MoE compression stays here either way.
 
 ## Architecture at a glance
 
@@ -31,7 +31,7 @@ The components above are not as orthogonal as the bullet list suggests; they lay
 ├────────────────────────────────────────────────────────────────────────┤
 │ Algorithm layer                                                        │
 │   WHT rotation → Lloyd-Max codebook → per-group norm correction        │
-│   ├ Uniform 3/4-bit:   weight_quant.py        (eventually #39970)      │
+│   ├ Uniform 3/4-bit:   weight_quant.py        (upstream: #56685)       │
 │   └ Kurtosis-mixed:    mixed_bits.py          (plugin)                 │
 ├────────────────────────────────────────────────────────────────────────┤
 │ Storage layer                                                          │
@@ -125,7 +125,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 
 | Model family | Attention | Weight quant | Legacy KV monkey-patch | Notes |
 |---|---|---|---|---|
-| Qwen3 (0.6B-235B) | GQA | Works | Works | Use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) for KV cache compression once merged |
+| Qwen3 (0.6B-235B) | GQA | Works | Works | For KV cache compression use upstream `--kv-cache-dtype turboquant_*` ([vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479), merged 2026-04-15) |
 | Gemma 4 26B | GQA | Works (4.79/5) | Works | Flagship benchmark model |
 | GLM-5.1 754B | **MLA (DSA)** | Works (native TQ3 ckpt, 2×H200) | Untested | Requires DeepGEMM + `--quantization turboquant` |
 | GLM-4.7-Flash 355B | **MLA** | Works (native TQ3 ckpt) | **Works** | **Only place TurboQuant KV works on MLA today** — #38479 does not cover MLA |
@@ -139,7 +139,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 **Where to get KV cache compression:**
 
 - **GQA/MHA models** (Qwen, Llama, Mistral, Gemma): use upstream `--kv-cache-dtype turboquant_3bit_nc` on stock vLLM (merged in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)). This plugin's old `--kv-cache-dtype tq3` path has been removed.
-- **MLA models** (GLM-4.7, DeepSeek-V3): use this plugin's `TQ_KV_K_BITS=4` monkey-patch path. It is the only option today. Will be retired once upstream adds MLA support.
+- **MLA models** (GLM-4.7, DeepSeek-V3): use this plugin's `TQ_KV_K_BITS=4` monkey-patch path. As of 2026-09-19 it is still the only merged option; upstream MLA TurboQuant backends are in review ([#41803](https://github.com/vllm-project/vllm/pull/41803), [#52472](https://github.com/vllm-project/vllm/pull/52472)). It will be retired once one lands.
 - **Hybrid models** (Qwen3.5, gpt-oss): neither path is fully supported yet. Weight quantization still works.
 
 ## Install
@@ -311,8 +311,8 @@ The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2
 
 Two independent implementations of the same algorithm exist, with different trade-offs:
 
-- **This plugin (`pip install turboquant-plus-vllm`)** — monkey-patches vLLM at import time via the `vllm.general_plugins` entry point. Validated on **vLLM 0.19–0.20**, and as of **v0.13.12** on **vLLM 0.25.x for dense and MoE models** (GPU-verified on A100: Qwen3-8B dense and OLMoE-1B-7B online `TQ_WEIGHT_BITS=3` both start, compress, capture CUDA graphs, and decode). Three vLLM-0.25 breaks were fixed getting there: engine init crashed on 0.25's non-class `FusedMoE` export (v0.13.10); 0.25's default AOT compile binds parameters by name and hit `KeyError: 'weight'` since the plugin replaces `.weight` with compressed buffers, so v0.13.11 defaults `VLLM_USE_AOT_COMPILE` off; and 0.25 made `FusedMoE` a factory function (the expert-weight module is now `RoutedExperts`) and added `shared_experts=` to the MoE `apply()` signature, so v0.13.12 matches `RoutedExperts` and forwards the new kwargs. Includes the CUDA bs=1 fused-dequant kernel; enabled through the `TQ_WEIGHT_BITS` env var; fully standalone.
-- **Upstream `--quantization turboquant`** ([vLLM PR #39970](https://github.com/vllm-project/vllm/pull/39970) + the MoE follow-up) — native vLLM scheme. Same algorithm, routed through `OnlineQuantizationConfig`. Not yet merged. When it lands you get `vllm serve <model> --quantization turboquant` without any plugin install, at the cost of tracking vLLM versions.
+- **This plugin (`pip install turboquant-plus-vllm`)** — monkey-patches vLLM at import time via the `vllm.general_plugins` entry point. Validated on **vLLM 0.19–0.20**, and as of **v0.13.12** on **vLLM 0.25.x for dense and MoE models** (GPU-verified on A100: Qwen3-8B dense and OLMoE-1B-7B online `TQ_WEIGHT_BITS=3` both start, compress, capture CUDA graphs, and decode). Three vLLM-0.25 breaks were fixed getting there: engine init crashed on 0.25's non-class `FusedMoE` export (v0.13.10); 0.25's default AOT compile binds parameters by name and hit `KeyError: 'weight'` since the plugin replaces `.weight` with compressed buffers, so v0.13.11 defaults `VLLM_USE_AOT_COMPILE` off; and 0.25 made `FusedMoE` a factory function (the expert-weight module is now `RoutedExperts`) and added `shared_experts=` to the MoE `apply()` signature, so v0.13.12 matches `RoutedExperts` and forwards the new kwargs. Includes the CUDA bs=1 fused-dequant kernel; enabled through the `TQ_WEIGHT_BITS` env var; fully standalone. **Not yet validated on vLLM 0.26–0.29** (0.29.0 was released 2026-09-09); treat those versions as untested.
+- **Upstream `--quantization turboquant`** ([vLLM PR #39970](https://github.com/vllm-project/vllm/pull/39970) + the MoE follow-up) — native vLLM scheme, same algorithm, routed through `OnlineQuantizationConfig`. **Closed unmerged on 2026-07-24**; the equivalent upstream work now sits in the `humming` framework ([#56685](https://github.com/vllm-project/vllm/pull/56685), open). The upstream-path notes below apply only to builds of the #39970 branch.
 
 The **upstream MoE path requires forcing the Triton MoE backend** (FlashInfer-CUTLASS and AITER permute expert weight storage during setup, which breaks the shared scratch-pool invariant both paths rely on):
 
@@ -675,7 +675,7 @@ Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blo
 
 ## Related projects
 
-- **[vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970)** — Our upstream vLLM PR adding weight compression as `--quantization turboquant` (Linear-only, MoE deferred). Mirrors what this plugin does, landed into vLLM's `OnlineQuantScheme` framework. Awaiting maintainer review.
+- **[vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970)** — Our upstream vLLM PR adding weight compression as `--quantization turboquant` (Linear-only, MoE deferred). Mirrors what this plugin does, built on vLLM's `OnlineQuantScheme` framework. Closed unmerged on 2026-07-24 in favour of the in-tree `humming` framework; the Hadamard follow-up [#42997](https://github.com/vllm-project/vllm/pull/42997) was in turn closed on 2026-09-14 for [#56685](https://github.com/vllm-project/vllm/pull/56685), which is open.
 - **[vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** — @vibhavagarwal5's upstream TurboQuant KV-cache PR (merged 2026-04-15). The actual TurboQuant algorithm for KV + ANN.
 - **[HIGGS paper](https://aclanthology.org/2025.naacl-long.543/)** — Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh; NAACL 2025. Primary algorithm citation for this plugin's weight path (preprint [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)). Reference implementation also in HuggingFace transformers as `HiggsConfig`.
 - **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026. Online vector quantizer for KV cache / ANN — the framework this project started from, and the algorithm behind #38479's KV path.
